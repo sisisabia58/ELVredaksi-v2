@@ -6,7 +6,7 @@
 
 **Architecture:** Keep the v1 pipeline (`scout.scan → analyst.score → copywriter.write → designer.render → publisher.publish`). Add a `Crawler` adapter next to the RSS fetcher so a source can be `rss` or `crawl`. Swap the analyst rubric and copywriter prompt to perspective rules and add a verbatim-copy guard. Add an `ImageProvider` adapter and one new job, `designer.cover`, that runs after a human approves a draft and feeds the existing cover-photo slot. Every new adapter ships with a local fake so tests and demo mode need no keys.
 
-**Tech Stack:** Next.js 15, TypeScript, PGlite/Postgres (`Sql` from `src/db/client.ts`), Vitest (`npx vitest run <file>`), zod, sharp, Playwright rasterizer. Crawler vendor and image vendor are open items (see Deferred).
+**Tech Stack:** Next.js 15, TypeScript, PGlite/Postgres (`Sql` from `src/db/client.ts`), Vitest (`npx vitest run <file>`), zod, sharp, Playwright rasterizer. Crawler: Tavily REST (Map and Extract endpoints). Images: Cloudflare Workers AI REST, model `@cf/black-forest-labs/flux-1-schnell`. Both are called with plain `fetch`, no SDK.
 
 **Spec:** `docs/v2-plan.md`
 
@@ -18,8 +18,9 @@
 - No copied photos: never download or hotlink an image from a source article or feed. AI covers are allowed.
 - An AI cover always carries the visible label `Ilustrasi AI` on slide 1 and the caption line `Cover: ilustrasi AI.`
 - AI cover is generated only after a human approves the draft, only for slide 1, and counts against its own daily cap `MAX_AI_COVERS_PER_DAY` (unset or invalid = 10, 0 = off), reset at WIB midnight.
-- Crawler: `CRAWLER_PROVIDER` unset or `fake` = no network. `CRAWL_MAX_ARTICLES_PER_SCAN` unset or invalid = 5 articles per crawl source per scan. A fetched article under 400 characters of text is not a topic.
-- Image: `IMAGE_PROVIDER` unset or `demo` = local fake, cost 0.
+- Crawler: `CRAWLER_PROVIDER` is `fake` (default when unset, no network) or `tavily` (needs `TAVILY_API_KEY`). `CRAWL_MAX_ARTICLES_PER_SCAN` unset or invalid = 5 articles per crawl source per scan. A fetched article under 400 characters of text is not a topic. Tavily does not return an author, so `author` is usually null; the caption always credits the source name and adds the author only when known.
+- Image: `IMAGE_PROVIDER` is `demo` (default when unset, local fake, cost 0) or `cloudflare` (needs `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`). `CLOUDFLARE_IMAGE_USD_PER_IMAGE` sets the cost recorded per cover; unset = 0 with a one-time warning.
+- Secrets (`TAVILY_API_KEY`, `CLOUDFLARE_API_TOKEN`) never appear in thrown error messages, logs, activity rows or `last_error`.
 - Niche and output language are per-brand settings. `brand.output_lang` is `ID` or `EN`. `sources.lang` stays per source.
 - Keep sources curated by the operator. No automatic source discovery.
 
@@ -44,7 +45,8 @@
   - `type CrawledArticle = { url: string; title: string; author: string | null; text: string; publishedAt: Date | null }`
   - `interface Crawler { listing(url: string): Promise<string[]>; article(url: string): Promise<CrawledArticle> }`
   - `class FakeCrawler implements Crawler` constructed with `{ listings?: Record<string, string[]>; articles?: Record<string, CrawledArticle>; failOn?: string[] }`
-  - `class FirecrawlCrawler implements Crawler` constructed with `(apiKey: string, fetchImpl?: typeof fetch)`
+  - `class TavilyCrawler implements Crawler` constructed with `(apiKey: string, fetchImpl?: typeof fetch)`; `listing` uses Tavily Map, `article` uses Tavily Extract
+  - `function titleFromMarkdown(markdown: string, fallbackUrl: string): string` (first `# ` heading, else the last URL path segment with dashes turned into spaces)
   - `function createCrawler(env?: Record<string, string | undefined>): Crawler` (picks by `CRAWLER_PROVIDER`)
   - `function canonicalUrl(url: string): string`
   - `function articleLinksFromListing(listingUrl: string, links: string[], max: number): string[]`
@@ -52,19 +54,20 @@
 - [ ] **Step 1: Write the failing tests in `tests/crawler.test.ts`**
   - `canonicalUrl("https://Blog.Example/Post/?utm_source=x&ref=y#top")` equals `"https://blog.example/Post"`; `canonicalUrl("https://blog.example/")` equals `"https://blog.example/"`; params that are not tracking params (`?id=7`) are kept.
   - `articleLinksFromListing("https://blog.example/", [ "https://blog.example/p/one", "https://blog.example/tag/ai", "https://other.site/p/x", "https://blog.example/p/one?utm_source=a", "mailto:a@b.c", "https://blog.example/" ], 5)` returns `["https://blog.example/p/one"]` (same host only, drops the listing itself, drops `/tag/`, `/author/`, `/category/`, `/page/` paths and non-http links, dedupes by canonical URL, honours `max`).
-  - `FakeCrawler.listing` returns the configured list, throws for URLs in `failOn`; `createCrawler({})` returns a `FakeCrawler`; `createCrawler({ CRAWLER_PROVIDER: "firecrawl" })` throws `"FIRECRAWL_API_KEY is required"`.
-  - `FirecrawlCrawler.article` called with a stub `fetchImpl` returning a scrape response maps markdown to `text`, title and author when present, and rejects a non-2xx response with an error whose message has no API key in it.
+  - `FakeCrawler.listing` returns the configured list, throws for URLs in `failOn`; `createCrawler({})` returns a `FakeCrawler`; `createCrawler({ CRAWLER_PROVIDER: "tavily" })` throws `"TAVILY_API_KEY is required"`.
+  - `titleFromMarkdown("intro\n# Real Title\nbody", "https://b.example/p/x")` is `"Real Title"`; with no heading and URL `https://b.example/p/my-first-post` it is `"my first post"`.
+  - `TavilyCrawler.listing` called with a stub `fetchImpl` posts the listing URL to the Map endpoint with `Authorization: Bearer <key>` and returns the URLs from the response. `TavilyCrawler.article` posts the article URL to the Extract endpoint requesting markdown, maps the first result's raw content to `text`, sets `author` to null, and throws when the response has no result for the URL (the error message names the URL, not the key). A non-2xx response throws an error whose message contains the status code and not the API key.
 
 - [ ] **Step 2: Run `npx vitest run tests/crawler.test.ts`**
   Expected: FAIL, modules not found.
 
 - [ ] **Step 3: Implement `src/crawl/canonical.ts` and `src/crawl/crawler.ts`**
-  `canonicalUrl` lower-cases host, drops fragment, drops params `utm_*`, `ref`, `source`, `fbclid`, `gclid`, and drops a trailing slash unless the path is `/`. `FirecrawlCrawler` calls the vendor's scrape endpoint requesting markdown plus links. Check the endpoint path, request body and response field names against the vendor's current docs before writing the mapping, and cover the shape in the stub test. Run `assertPublicFetchUrl` (from `src/rss/fetch-guard.ts`) on every URL before sending it to the vendor. Never include the API key in thrown messages.
+  `canonicalUrl` lower-cases host, drops fragment, drops params `utm_*`, `ref`, `source`, `fbclid`, `gclid`, and drops a trailing slash unless the path is `/`. `TavilyCrawler` calls `https://api.tavily.com/map` (body `{ url }`, response list of URLs) for `listing` and `https://api.tavily.com/extract` (body `{ urls: [url], format: "markdown" }`, response `results[].raw_content`) for `article`, both with a bearer token and a 30 s timeout. These paths and field names are from memory: check them against the Tavily docs before writing the mapping, and make the stub test assert the exact shape you verified. Run `assertPublicFetchUrl` (from `src/rss/fetch-guard.ts`) on every URL before sending it to Tavily. Never include the API key in thrown messages. `publishedAt` is null (Extract does not return it).
 
 - [ ] **Step 4: Run `npx vitest run tests/crawler.test.ts`**
   Expected: PASS.
 
-- [ ] **Step 5: Commit** `feat: add crawler adapter with fake and firecrawl`
+- [ ] **Step 5: Commit** `feat: add crawler adapter with fake and tavily`
 
 ### Task 2: Crawl sources in Scout
 
@@ -213,16 +216,19 @@
   - `interface ImageProvider { cover(req: CoverRequest): Promise<CoverResult> }`
   - `class DemoImageProvider implements ImageProvider` (sharp-generated 1080×1350 solid-accent PNG, `costUsd: 0`, `model: "demo"`)
   - `class ScriptedImageProvider implements ImageProvider` (queue of results or errors, for tests)
-  - `function createImageProvider(env?): ImageProvider` (`IMAGE_PROVIDER` unset or `demo` returns Demo; any other value throws `"unknown IMAGE_PROVIDER"` until a vendor is added)
-  - `function coverPrompt(req: CoverRequest): string`
+  - `class CloudflareImageProvider implements ImageProvider` constructed with `(opts: { accountId: string; apiToken: string; usdPerImage?: number; fetchImpl?: typeof fetch })`; `model` is `"@cf/black-forest-labs/flux-1-schnell"`
+  - `function createImageProvider(env?): ImageProvider` (`IMAGE_PROVIDER` unset or `demo` returns Demo; `cloudflare` returns Cloudflare and throws `"CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required"` when either is missing; any other value throws `"unknown IMAGE_PROVIDER"`)
+  - `function coverPrompt(req: CoverRequest): string` (at most 2000 characters, the model's prompt limit is 2048)
 
 - [ ] **Step 1: Write the failing tests**
-  `DemoImageProvider.cover` returns a PNG with sharp metadata 1080×1350. `coverPrompt` contains the headline, the niche, and the exact phrases `no text`, `no logos`, `no real people`. `createImageProvider({})` returns a Demo; `createImageProvider({ IMAGE_PROVIDER: "x" })` throws.
+  `DemoImageProvider.cover` returns a PNG with sharp metadata 1080×1350. `coverPrompt` contains the headline, the niche, and the exact phrases `no text`, `no logos`, `no real people`, and is at most 2000 characters even for a 500-character headline. `createImageProvider({})` returns a Demo; `createImageProvider({ IMAGE_PROVIDER: "x" })` throws; `cloudflare` with a missing token throws.
+  - `CloudflareImageProvider.cover` with a stub `fetchImpl`: asserts one POST to `https://api.cloudflare.com/client/v4/accounts/<accountId>/ai/run/@cf/black-forest-labs/flux-1-schnell` with `Authorization: Bearer <token>`, a JSON body containing `prompt` and `steps: 4`, and maps a response `{ "result": { "image": "<base64 jpeg>" }, "success": true }` to bytes with `contentType: "image/jpeg"` (detect JPEG or PNG from the decoded bytes with `sharp(...).metadata()`, do not trust a header) and `costUsd` equal to `usdPerImage`.
+  - Failure cases: `success: false` with an `errors` array throws with the first error message; a non-2xx status throws with the status code; an image that is neither PNG nor JPEG throws; none of the thrown messages contain the token. A request that never resolves is aborted after 60 s (use fake timers).
 
 - [ ] **Step 2: Run `npx vitest run tests/image.test.ts`**
   Expected: FAIL.
 
-- [ ] **Step 3: Implement** the files above. Add `IMAGE_PROVIDER=demo` and `MAX_AI_COVERS_PER_DAY=` to `.env.example`.
+- [ ] **Step 3: Implement** the files above. The Cloudflare REST path, request fields (`prompt`, `steps`) and response shape (`result.image` as base64, `success`, `errors`) are from memory: check them, plus the supported output size and the `steps` maximum, against the Cloudflare Workers AI docs for the model before writing the mapping, and make the stub test assert what you verified. The model may return a square image: do not resize it here, the template's cover-fit and focal slider already crop to 1080×1350. Add `IMAGE_PROVIDER=demo`, `CLOUDFLARE_ACCOUNT_ID=`, `CLOUDFLARE_API_TOKEN=`, `CLOUDFLARE_IMAGE_USD_PER_IMAGE=`, `CRAWLER_PROVIDER=fake`, `TAVILY_API_KEY=` and `MAX_AI_COVERS_PER_DAY=` to `.env.example`.
 
 - [ ] **Step 4: Run `npx vitest run tests/image.test.ts`**
   Expected: PASS.
@@ -239,7 +245,7 @@
 **Interfaces:**
 - Consumes: `ImageProvider`, `createImageProvider`, `coverPrompt` from Task 7; `quotaDay` from `render-quota.ts`.
 - Produces:
-  - Columns `drafts.cover_image bytea`, `drafts.cover_ai boolean not null default false`, `drafts.cover_pending boolean not null default false`; table `cover_quota (day date primary key, used integer not null default 0)`.
+  - Columns `drafts.cover_image bytea`, `drafts.cover_type text` (`image/png` or `image/jpeg`), `drafts.cover_ai boolean not null default false`, `drafts.cover_pending boolean not null default false`; table `cover_quota (day date primary key, used integer not null default 0)`.
   - `maxAiCoversPerDay(env?): number`, `reserveAiCover(sql, now, cap): Promise<boolean>` in `src/jobs/cover-quota.ts` (same semantics as `reserveAutoRender`).
   - `JobName` gains `"designer.cover"`; `type CoverCtx = JobCtx & { imageProvider?: ImageProvider }`; `runCoverJob(ctx: CoverCtx): Promise<void>` with payload `{ draftId: string }`.
   - `RenderSlideInput.aiCover?: boolean`.
@@ -259,8 +265,8 @@
 - [ ] **Step 3: Implement**
   - Schema and boot migrations for the columns and table.
   - `approveDraftInTx`: after the status update, if the draft has no `cover_ai` cover and no unfinished `designer.cover` job, set `cover_pending = true` and `enqueue(tx, { name: "designer.cover", payload: { draftId: id }, runAt: now, manual: false })`. Not gated by work hours (add nothing to `WORK_HOUR_GATED`).
-  - `runCoverJob`: reserve a slot (fall back when refused), call `imageProvider.cover(...)` with niche and accent from `brand`, store bytes, record spend, clear `cover_pending` in a `finally`-safe path on every outcome, then enqueue `designer.render` with `manual: true`.
-  - `runDesigner`: for slide index 0 use `data:<contentType>;base64,<cover_image>` as the cover photo when `cover_image` is set and no operator-uploaded `photoDataUrl` exists (operator upload wins). Pass `aiCover` to the renderer when the cover came from `cover_image`.
+  - `runCoverJob`: reserve a slot (fall back when refused), call `imageProvider.cover(...)` with niche and accent from `brand`, store bytes and `cover_type`, record spend, clear `cover_pending` in a `finally`-safe path on every outcome, then enqueue `designer.render` with `manual: true`.
+  - `runDesigner`: for slide index 0 use `data:<cover_type>;base64,<cover_image>` (it must pass `safePhotoDataUrl`, which accepts png, jpeg and webp) as the cover photo when `cover_image` is set and no operator-uploaded `photoDataUrl` exists (operator upload wins). Pass `aiCover` to the renderer when the cover came from `cover_image`.
   - Add `blockIfCoverPending(row.cover_pending)` beside every existing `blockIfDirty` call for scheduling and posting.
   - Badge text `Ilustrasi AI`, small, bottom corner of slide 0, in the common wrapper and the berita_pro template.
   - Editor panel shows `Cover AI sedang dibuat…` while `cover_pending`.
@@ -296,13 +302,14 @@
 
 ## Deferred until the open items are decided
 
-- A real `ImageProvider` (vendor and model) and its per-image cost into `llm_spend`.
-- Live Firecrawl run against a real feed-less source, and tuning `CRAWL_MAX_ARTICLES_PER_SCAN`.
+- A live smoke test of `TavilyCrawler` against one real feed-less source and of `CloudflareImageProvider` against the real API. Both need keys, and this cloud session's network allowlist must include `api.tavily.com` and `api.cloudflare.com` before they can run here.
+- Setting `CLOUDFLARE_IMAGE_USD_PER_IMAGE` from Cloudflare's current pricing, and tuning `CRAWL_MAX_ARTICLES_PER_SCAN` once Tavily credit use per scan is known.
 - A/B testing of AI versus geometric covers using Analitik data.
 - Final wording of the AI label if it must differ from `Ilustrasi AI`.
 
 ## Self-Review notes
 
+- **Vendors:** Tavily is Task 1, Cloudflare FLUX.1 Schnell is Task 7. Both have fakes, so Tasks 2 and 8 and every test run without keys.
 - **Spec coverage:** crawler and sources (Tasks 1-2), no copied photos (3), niche and language (4), perspective scoring (5), summarize-only (6), AI cover after approval with cap, label and fallback (7-8), repositioning (9). Cost tuning, A/B and source discovery are explicitly out of scope per the spec.
 - **Types:** `Crawler`, `CrawledArticle`, `canonicalUrl` (Task 1) are the names used in Task 2. `ImageProvider`, `CoverRequest`, `coverPrompt` (Task 7) are the names used in Task 8. `AspectScores` keys (Task 5) are used in Task 5 only.
 - **Order:** Tasks 1-2 and 7 can run in parallel with 3-6; Task 8 needs 7; Task 9 goes last.
