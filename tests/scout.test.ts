@@ -6,6 +6,7 @@ import { seedDefaults } from "../src/db/seed";
 import { addSource, deleteSource, listSources } from "../src/studio/sources";
 import { jobHandlers, runScout } from "../src/jobs/handlers";
 import { enqueue, runDueJobs } from "../src/jobs/runner";
+import { FakeCrawler, type CrawledArticle } from "../src/crawl/crawler";
 import { isBlockedFetchTarget, createPinnedLookup, PRIVATE_FETCH_MESSAGE } from "../src/rss/fetch-guard";
 
 const xml = `<?xml version="1.0"?><rss><channel>
@@ -335,5 +336,102 @@ describe("scout", () => {
       "select title, excerpt, url from topics order by title",
     );
     expect(topics).toEqual([{ title: "Publik", excerpt: "", url: "https://news.example/public" }]);
+  });
+});
+
+const longText = "Perspektif panjang tentang cara kerja tim kecil. ".repeat(20);
+
+function article(url: string, over: Partial<CrawledArticle> = {}): CrawledArticle {
+  return { url, title: "Esai", author: "Dina", text: longText, publishedAt: null, ...over };
+}
+
+async function crawlScan(sql: Awaited<ReturnType<typeof createTestSql>>, crawler: FakeCrawler, feed = xml) {
+  await runScout({
+    sql,
+    payload: {},
+    manual: true,
+    now: new Date("2026-10-28T01:00:00Z"),
+    fetchFeed: async () => feed,
+    fetchPage: async () => "<p>Fakta.</p>",
+    crawler,
+  });
+}
+
+describe("scout crawl sources", () => {
+  it("stores crawled articles with author and capped excerpt and queues scoring", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Blog", url: "https://blog.example/", lang: "EN", kind: "crawl" });
+    const crawler = new FakeCrawler({
+      listings: { "https://blog.example/": ["https://blog.example/p/1", "https://blog.example/p/2"] },
+      articles: {
+        "https://blog.example/p/1": article("https://blog.example/p/1", { text: "x".repeat(15000) }),
+        "https://blog.example/p/2": article("https://blog.example/p/2"),
+      },
+    });
+    await crawlScan(sql, crawler);
+    const topics = await sql.rows<{ author: string; excerpt: string; summary: string }>(
+      "select author, excerpt, summary from topics order by url",
+    );
+    expect(topics).toHaveLength(2);
+    expect(topics[0]).toMatchObject({ author: "Dina", summary: "" });
+    expect(topics[0].excerpt).toHaveLength(12000);
+    const jobs = await sql.rows<{ name: string }>("select name from jobs where name = 'analyst.score'");
+    expect(jobs).toHaveLength(2);
+    expect((await listSources(sql))[0].kind).toBe("crawl");
+  });
+
+  it("treats the same article from rss and crawl as one topic with a canonical url", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "A feed", url: "https://news.example/feed", lang: "ID" });
+    await addSource(sql, "admin", { name: "B crawl", url: "https://news.example/", lang: "ID", kind: "crawl" });
+    const feed = `<?xml version="1.0"?><rss><channel><item><title>Sama</title>
+      <link>https://news.example/a?utm_source=x</link><description>c</description></item></channel></rss>`;
+    const crawler = new FakeCrawler({
+      listings: { "https://news.example/": ["https://news.example/a/"] },
+      articles: { "https://news.example/a": article("https://news.example/a") },
+    });
+    await crawlScan(sql, crawler, feed);
+    const topics = await sql.rows<{ url: string }>("select url from topics");
+    expect(topics).toEqual([{ url: "https://news.example/a" }]);
+  });
+
+  it("skips too-short pages and reports it on the source", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Blog", url: "https://blog.example/", lang: "EN", kind: "crawl" });
+    const crawler = new FakeCrawler({
+      listings: { "https://blog.example/": ["https://blog.example/p/wall"] },
+      articles: { "https://blog.example/p/wall": article("https://blog.example/p/wall", { text: "x".repeat(100) }) },
+    });
+    await crawlScan(sql, crawler);
+    expect(await sql.rows("select id from topics")).toHaveLength(0);
+    const rows = await listSources(sql);
+    expect(rows[0].lastError).toContain("terlalu pendek");
+  });
+
+  it("fetches at most five articles per crawl source per scan", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Blog", url: "https://blog.example/", lang: "EN", kind: "crawl" });
+    const urls = Array.from({ length: 8 }, (_, i) => `https://blog.example/p/${i}`);
+    const crawler = new FakeCrawler({
+      listings: { "https://blog.example/": urls },
+      articles: Object.fromEntries(urls.map((u) => [u, article(u)])),
+    });
+    await crawlScan(sql, crawler);
+    expect(crawler.articleCalls).toHaveLength(5);
+    expect(await sql.rows("select id from topics")).toHaveLength(5);
+  });
+
+  it("validates source kind and defaults to rss", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Plain", url: "https://news.example/feed", lang: "ID" });
+    expect((await listSources(sql))[0].kind).toBe("rss");
+    await expect(
+      addSource(sql, "admin", { name: "Bad", url: "https://x.example/", lang: "ID", kind: "pdf" as never }),
+    ).rejects.toThrow();
   });
 });

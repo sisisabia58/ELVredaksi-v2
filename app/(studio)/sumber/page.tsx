@@ -23,6 +23,7 @@ export default async function SumberPage() {
     name: source.name,
     url: source.url,
     lang: source.lang,
+    kind: source.kind,
     enabled: source.enabled,
     topicCount: source.topicCount,
     passCount7d: source.passCount7d,

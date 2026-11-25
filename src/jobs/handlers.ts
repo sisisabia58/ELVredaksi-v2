@@ -27,6 +27,8 @@ import { createLlm, type LlmProvider } from "../llm/provider";
 import { fetchPublicText, PRIVATE_FETCH_MESSAGE } from "../rss/fetch-guard";
 import { excerptFromHtml, imageUrlFromHtml } from "../rss/excerpt";
 import { parseFeed } from "../rss/parse";
+import { canonicalUrl } from "../crawl/canonical";
+import { articleLinksFromListing, crawlMaxArticlesPerScan, createCrawler, type Crawler } from "../crawl/crawler";
 import { normalizeInsights, type DailyPoint } from "../studio/analytics";
 import { validateCoverPhotoDataUrl, withLockedDraftEdit } from "../studio/drafts";
 import { enqueue, type JobCtx } from "./runner";
@@ -35,7 +37,98 @@ import { autoRendersUsed, maxAutoRendersPerDay, reserveAutoRender } from "./rend
 export type ScoutCtx = JobCtx & {
   fetchFeed: (url: string) => Promise<string>;
   fetchPage: (url: string) => Promise<string>;
+  crawler?: Crawler;
 };
+
+const CRAWL_MIN_TEXT_CHARS = 400;
+const CRAWL_EXCERPT_MAX_CHARS = 12000;
+
+type NewTopic = {
+  sourceId: string;
+  title: string;
+  url: string;
+  summary: string;
+  excerpt: string;
+  publishedAt: Date | null;
+  imageUrl: string | null;
+  author: string | null;
+};
+
+async function insertTopicAndQueueScore(ctx: ScoutCtx, topic: NewTopic): Promise<boolean> {
+  return ctx.sql.tx(async (tx) => {
+    const inserted = await tx.rows<{ id: string }>(
+      `insert into topics (id, source_id, title, url, summary, excerpt, published_at, image_url, author)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       on conflict (url) do nothing
+       returning id`,
+      [
+        randomUUID(),
+        topic.sourceId,
+        topic.title,
+        topic.url,
+        topic.summary,
+        topic.excerpt,
+        topic.publishedAt,
+        topic.imageUrl,
+        topic.author,
+      ],
+    );
+    if (!inserted[0]) {
+      return false;
+    }
+    await enqueue(tx, {
+      name: "analyst.score",
+      payload: { topicId: inserted[0].id },
+      runAt: ctx.now,
+      manual: ctx.manual,
+    });
+    return true;
+  });
+}
+
+async function scoutCrawlSource(
+  ctx: ScoutCtx,
+  source: { id: string; url: string },
+): Promise<{ added: number; notes: string[] }> {
+  const crawler = ctx.crawler ?? createCrawler();
+  const links = articleLinksFromListing(source.url, await crawler.listing(source.url), Number.MAX_SAFE_INTEGER);
+  const max = crawlMaxArticlesPerScan();
+  let added = 0;
+  let fetched = 0;
+  let tooShort = 0;
+  for (const link of links) {
+    if (fetched >= max) {
+      break;
+    }
+    const known = await ctx.sql.rows<{ id: string }>(`select id from topics where url = $1 limit 1`, [link]);
+    if (known.length > 0) {
+      continue;
+    }
+    fetched += 1;
+    const article = await crawler.article(link);
+    if (article.text.trim().length < CRAWL_MIN_TEXT_CHARS) {
+      tooShort += 1;
+      continue;
+    }
+    const inserted = await insertTopicAndQueueScore(ctx, {
+      sourceId: source.id,
+      title: article.title,
+      url: link,
+      summary: "",
+      excerpt: article.text.slice(0, CRAWL_EXCERPT_MAX_CHARS),
+      publishedAt: article.publishedAt,
+      imageUrl: null,
+      author: article.author,
+    });
+    if (inserted) {
+      added += 1;
+    }
+  }
+  return {
+    added,
+    notes: tooShort > 0 ? [`${tooShort} halaman dilewati: teks terlalu pendek (di bawah ${CRAWL_MIN_TEXT_CHARS} karakter)`] : [],
+  };
+}
 
 async function hasQueuedScoutScan(sql: JobCtx["sql"]): Promise<boolean> {
   const rows = await sql.rows<{ id: string }>(
@@ -47,89 +140,84 @@ async function hasQueuedScoutScan(sql: JobCtx["sql"]): Promise<boolean> {
 }
 
 export async function runScout(ctx: ScoutCtx): Promise<void> {
-  const sources = await ctx.sql.rows<{ id: string; url: string }>(
-    `select id, url from sources where enabled = true order by name`,
+  const sources = await ctx.sql.rows<{ id: string; url: string; kind: string }>(
+    `select id, url, kind from sources where enabled = true order by name`,
   );
 
   let newTopicCount = 0;
 
   for (const source of sources) {
     try {
-      const xml = await ctx.fetchFeed(source.url);
-      const items = parseFeed(xml);
+      let notes: string[] = [];
+      if (source.kind === "crawl") {
+        const result = await scoutCrawlSource(ctx, source);
+        newTopicCount += result.added;
+        notes = result.notes;
+      } else {
+        const xml = await ctx.fetchFeed(source.url);
+        const items = parseFeed(xml);
 
-      for (const item of items) {
-        const known = await ctx.sql.rows<{ id: string }>(
-          `select id from topics where url = $1 limit 1`,
-          [item.url],
-        );
-        if (known.length > 0) {
-          if (item.imageUrl && known[0]) {
-            const filled = await ctx.sql.rows<{ id: string }>(
-              `update topics set image_url = $1
-               where id = $2 and coalesce(image_url, '') = ''
-               returning id`,
-              [item.imageUrl, known[0].id],
-            );
-            if (filled[0]) {
-              await ctx.sql.rows(
-                `update drafts set text_dirty = true, updated_at = $1
-                 where topic_id = $2 and status in ('needs_review', 'drafted')`,
-                [ctx.now, known[0].id],
+        for (const item of items) {
+          const itemUrl = canonicalUrl(item.url);
+          const known = await ctx.sql.rows<{ id: string }>(
+            `select id from topics where url = $1 limit 1`,
+            [itemUrl],
+          );
+          if (known.length > 0) {
+            if (item.imageUrl && known[0]) {
+              const filled = await ctx.sql.rows<{ id: string }>(
+                `update topics set image_url = $1
+                 where id = $2 and coalesce(image_url, '') = ''
+                 returning id`,
+                [item.imageUrl, known[0].id],
               );
+              if (filled[0]) {
+                await ctx.sql.rows(
+                  `update drafts set text_dirty = true, updated_at = $1
+                   where topic_id = $2 and status in ('needs_review', 'drafted')`,
+                  [ctx.now, known[0].id],
+                );
+              }
             }
-          }
-          continue;
-        }
-
-        let excerpt = "";
-        let imageUrl = item.imageUrl;
-        try {
-          const html = await ctx.fetchPage(item.url);
-          excerpt = excerptFromHtml(html);
-          if (!imageUrl) {
-            imageUrl = imageUrlFromHtml(html, item.url);
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (message === PRIVATE_FETCH_MESSAGE) {
             continue;
           }
-          excerpt = "";
-        }
 
-        await ctx.sql.tx(async (tx) => {
-          const inserted = await tx.rows<{ id: string }>(
-            `insert into topics (id, source_id, title, url, summary, excerpt, published_at, image_url)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)
-             on conflict (url) do nothing
-             returning id`,
-            [
-              randomUUID(),
-              source.id,
-              item.title,
-              item.url,
-              item.summary,
-              excerpt,
-              item.publishedAt,
-              imageUrl,
-            ],
-          );
-          if (inserted[0]) {
-            newTopicCount += 1;
-            await enqueue(tx, {
-              name: "analyst.score",
-              payload: { topicId: inserted[0].id },
-              runAt: ctx.now,
-              manual: ctx.manual,
-            });
+          let excerpt = "";
+          let imageUrl = item.imageUrl;
+          try {
+            const html = await ctx.fetchPage(item.url);
+            excerpt = excerptFromHtml(html);
+            if (!imageUrl) {
+              imageUrl = imageUrlFromHtml(html, item.url);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (message === PRIVATE_FETCH_MESSAGE) {
+              continue;
+            }
+            excerpt = "";
           }
-        });
+
+          if (
+            await insertTopicAndQueueScore(ctx, {
+              sourceId: source.id,
+              title: item.title,
+              url: itemUrl,
+              summary: item.summary,
+              excerpt,
+              publishedAt: item.publishedAt,
+              imageUrl,
+              author: null,
+            })
+          ) {
+            newTopicCount += 1;
+          }
+        }
       }
 
       await ctx.sql.rows(
-        `update sources set last_error = null, last_fetched_at = $1 where id = $2`,
-        [ctx.now, source.id],
+        `update sources set last_error = $1, last_fetched_at = $2 where id = $3`,
+        [notes.length > 0 ? notes.join("; ") : null, ctx.now, source.id],
       );
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 300);

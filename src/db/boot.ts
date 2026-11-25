@@ -233,6 +233,7 @@ const SCHEMA_EXTRAS = [
   "alter table brand add column if not exists logo bytea",
   "alter table brand add column if not exists logo_type text",
   "alter table topics add column if not exists image_url text",
+  "alter table topics add column if not exists author text",
   `create table if not exists image_cache (
     url_hash text primary key,
     url text not null,

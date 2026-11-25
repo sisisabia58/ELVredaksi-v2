@@ -134,3 +134,12 @@ export function createCrawler(env: Record<string, string | undefined> = process.
   }
   throw new Error("unknown CRAWLER_PROVIDER");
 }
+
+export const DEFAULT_CRAWL_MAX_ARTICLES_PER_SCAN = 5;
+
+/** CRAWL_MAX_ARTICLES_PER_SCAN: unset or invalid = 5 articles per crawl source per scan. */
+export function crawlMaxArticlesPerScan(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.CRAWL_MAX_ARTICLES_PER_SCAN?.trim();
+  if (!raw || !/^\d+$/.test(raw) || Number(raw) < 1) return DEFAULT_CRAWL_MAX_ARTICLES_PER_SCAN;
+  return Number(raw);
+}

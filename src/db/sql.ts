@@ -61,6 +61,7 @@ create table if not exists topics (
   title text not null,
   url text not null unique,
   summary text not null default '',
+  author text,
   excerpt text not null default '',
   published_at timestamptz,
   discovered_at timestamptz not null default now(),

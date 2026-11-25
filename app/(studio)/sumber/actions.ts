@@ -42,6 +42,7 @@ export async function addSourceAction(input: {
   name: string;
   url: string;
   lang: "ID" | "EN";
+  kind: "rss" | "crawl";
 }): Promise<ActionResult> {
   try {
     const { sql, user } = await requireSourceAdmin();
@@ -80,6 +81,7 @@ export type SourceView = {
   name: string;
   url: string;
   lang: "ID" | "EN";
+  kind: "rss" | "crawl";
   enabled: boolean;
   topicCount: number;
   passCount7d: number;

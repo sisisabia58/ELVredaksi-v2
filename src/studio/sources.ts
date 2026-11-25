@@ -8,6 +8,7 @@ export type SourceRow = {
   name: string;
   url: string;
   lang: "ID" | "EN";
+  kind: "rss" | "crawl";
   enabled: boolean;
   topicCount: number;
   passCount7d: number;
@@ -30,6 +31,7 @@ const sourceInputSchema = z.object({
       }
     }, "URL harus http atau https."),
   lang: z.enum(["ID", "EN"]),
+  kind: z.enum(["rss", "crawl"]).default("rss"),
 });
 
 function requireSourceWrite(role: Role): void {
@@ -41,13 +43,13 @@ function requireSourceWrite(role: Role): void {
 export async function addSource(
   sql: Sql,
   role: Role,
-  input: { name: string; url: string; lang: "ID" | "EN" },
+  input: { name: string; url: string; lang: "ID" | "EN"; kind?: "rss" | "crawl" },
 ): Promise<void> {
   requireSourceWrite(role);
   const parsed = sourceInputSchema.parse(input);
   await sql.rows(
-    `insert into sources (id, name, url, lang) values ($1, $2, $3, $4)`,
-    [randomUUID(), parsed.name, parsed.url, parsed.lang],
+    `insert into sources (id, name, url, lang, kind) values ($1, $2, $3, $4, $5)`,
+    [randomUUID(), parsed.name, parsed.url, parsed.lang, parsed.kind],
   );
 }
 
@@ -78,13 +80,14 @@ export async function listSources(sql: Sql): Promise<SourceRow[]> {
     name: string;
     url: string;
     lang: "ID" | "EN";
+    kind: "rss" | "crawl";
     enabled: boolean;
     last_fetched_at: Date | null;
     last_error: string | null;
     topic_count: number;
     pass_count_7d: number;
   }>(
-    `select s.id, s.name, s.url, s.lang, s.enabled, s.last_fetched_at, s.last_error,
+    `select s.id, s.name, s.url, s.lang, s.kind, s.enabled, s.last_fetched_at, s.last_error,
             (select count(*)::int from topics t where t.source_id = s.id) as topic_count,
             (select count(*)::int from topics t
                where t.source_id = s.id
@@ -98,6 +101,7 @@ export async function listSources(sql: Sql): Promise<SourceRow[]> {
     name: row.name,
     url: row.url,
     lang: row.lang,
+    kind: row.kind === "crawl" ? "crawl" : "rss",
     enabled: row.enabled,
     topicCount: Number(row.topic_count),
     passCount7d: Number(row.pass_count_7d),

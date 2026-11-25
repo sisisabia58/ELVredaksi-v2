@@ -27,6 +27,7 @@ export function SumberPanel({ sources }: { sources: SourceView[] }) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [lang, setLang] = useState<"ID" | "EN">("ID");
+  const [kind, setKind] = useState<"rss" | "crawl">("rss");
   const [formError, setFormError] = useState<string | null>(null);
   const [toggleError, setToggleError] = useState<string | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
@@ -36,7 +37,7 @@ export function SumberPanel({ sources }: { sources: SourceView[] }) {
     event.preventDefault();
     setFormError(null);
     startTransition(async () => {
-      const result = await addSourceAction({ name, url, lang });
+      const result = await addSourceAction({ name, url, lang, kind });
       if (!result.ok) {
         setFormError(result.error);
         return;
@@ -121,8 +122,19 @@ export function SumberPanel({ sources }: { sources: SourceView[] }) {
             </select>
           </div>
           <div className="space-y-2">
-            <Label>Jenis</Label>
-            <p className="text-sm pt-2">RSS/Atom</p>
+            <Label htmlFor="source-kind">Jenis</Label>
+            <select
+              id="source-kind"
+              value={kind}
+              onChange={(e) => setKind(e.target.value as "rss" | "crawl")}
+              className="flex h-9 w-full rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-1 text-sm text-[var(--ink)]"
+            >
+              <option value="rss">RSS/Atom</option>
+              <option value="crawl">Crawl halaman daftar</option>
+            </select>
+            {kind === "crawl" ? (
+              <p className="text-xs text-[var(--muted)]">URL adalah halaman daftar artikel, bukan satu artikel.</p>
+            ) : null}
           </div>
         </div>
         {formError ? <p className="text-sm text-[var(--bad)]">{formError}</p> : null}
@@ -168,6 +180,7 @@ export function SumberPanel({ sources }: { sources: SourceView[] }) {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-medium truncate">{source.name}</span>
                     <Badge variant="secondary">{source.lang}</Badge>
+                    {source.kind === "crawl" ? <Badge variant="secondary">crawl</Badge> : null}
                   </div>
                   <p className="text-sm text-[var(--muted)] truncate">{source.url}</p>
                   <p className="text-sm text-[var(--muted)]">
