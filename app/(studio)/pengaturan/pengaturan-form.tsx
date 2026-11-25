@@ -43,6 +43,8 @@ function brandFromSettings(settings: Settings): SettingsInput {
     defaultFormat: settings.defaultFormat,
     defaultTemplate: settings.defaultTemplate,
     slideCount: settings.slideCount,
+    niche: settings.niche,
+    outputLang: settings.outputLang,
     publicBaseUrl: settings.publicBaseUrl,
   };
 }
@@ -430,6 +432,30 @@ export function PengaturanForm({
               <option value="serif">Serif</option>
               <option value="berita_pro">Berita Pro</option>
               <option value="catatan">Catatan</option>
+            </select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="niche">Niche channel</Label>
+            <input
+              id="niche"
+              value={brand.niche}
+              maxLength={120}
+              onChange={(e) => setBrand((b) => ({ ...b, niche: e.target.value }))}
+              className={fieldClass}
+              placeholder="contoh: keuangan pribadi"
+            />
+            <p className="text-xs text-[var(--muted)]">Analis menilai kecocokan artikel dengan niche ini.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="outputLang">Bahasa output slide</Label>
+            <select
+              id="outputLang"
+              value={brand.outputLang}
+              onChange={(e) => setBrand((b) => ({ ...b, outputLang: e.target.value === "EN" ? "EN" : "ID" }))}
+              className={fieldClass}
+            >
+              <option value="ID">Indonesia</option>
+              <option value="EN">Inggris</option>
             </select>
           </div>
           <div className="space-y-1">

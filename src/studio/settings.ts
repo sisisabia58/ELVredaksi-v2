@@ -24,6 +24,8 @@ export type Settings = {
   defaultFormat: "carousel_full" | "teaser_bio";
   defaultTemplate: SlideTemplateName;
   slideCount: number;
+  niche: string;
+  outputLang: "ID" | "EN";
   hasLogo: boolean;
   publicBaseUrl: string;
   igUsername: string | null;
@@ -70,6 +72,8 @@ const settingsSchema = z.object({
   defaultFormat: z.enum(["carousel_full", "teaser_bio"]),
   defaultTemplate: z.enum(SLIDE_TEMPLATES),
   slideCount: z.number().int().min(2).max(3),
+  niche: z.string().trim().max(120, "Niche maksimal 120 karakter.").default(""),
+  outputLang: z.enum(["ID", "EN"]).default("ID"),
   publicBaseUrl: z.url("URL publik tidak valid."),
 });
 
@@ -86,6 +90,8 @@ export async function getSettings(sql: Sql): Promise<Settings> {
     default_format: Settings["defaultFormat"];
     default_template: Settings["defaultTemplate"];
     slide_count: number;
+    niche: string;
+    output_lang: "ID" | "EN";
     has_logo: boolean;
     public_base_url: string;
     practice_mode: boolean | null;
@@ -99,7 +105,7 @@ export async function getSettings(sql: Sql): Promise<Settings> {
     ig_refresh_error: string | null;
   }>(
     `select b.name, b.handle, b.initial, b.accent, b.kicker, b.work_start, b.work_end,
-            b.pass_threshold, b.default_format, b.default_template, b.slide_count,
+            b.pass_threshold, b.default_format, b.default_template, b.slide_count, b.niche, b.output_lang,
             (b.logo is not null) as has_logo, b.public_base_url, b.practice_mode,
             ig.username as ig_username, ig.ig_user_id, ig.access_token as ig_access_token,
             ig.api_host as ig_api_host,
@@ -135,6 +141,8 @@ export async function getSettings(sql: Sql): Promise<Settings> {
     defaultFormat: row.default_format,
     defaultTemplate: row.default_template,
     slideCount: clampSlideCount(row.slide_count),
+    niche: row.niche,
+    outputLang: row.output_lang === "EN" ? "EN" : "ID",
     hasLogo: Boolean(row.has_logo),
     publicBaseUrl: resolvePublicBaseUrl(row.public_base_url),
     igUsername: row.ig_username,
@@ -168,7 +176,8 @@ export async function saveSettings(sql: Sql, role: Role, input: SettingsInput): 
     `update brand set
        name = $1, handle = $2, initial = $3, accent = $4, kicker = $5,
        work_start = $6, work_end = $7, pass_threshold = $8,
-       default_format = $9, default_template = $10, slide_count = $11, public_base_url = $12
+       default_format = $9, default_template = $10, slide_count = $11, public_base_url = $12,
+       niche = $13, output_lang = $14
      where id = 1`,
     [
       parsed.name,
@@ -183,6 +192,8 @@ export async function saveSettings(sql: Sql, role: Role, input: SettingsInput): 
       parsed.defaultTemplate,
       parsed.slideCount,
       parsed.publicBaseUrl,
+      parsed.niche,
+      parsed.outputLang,
     ],
   );
 }

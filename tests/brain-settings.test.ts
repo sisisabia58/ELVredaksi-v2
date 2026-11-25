@@ -33,6 +33,8 @@ describe("brain and settings", () => {
       defaultFormat: "carousel_full",
       defaultTemplate: "stabilo",
       slideCount: 3,
+      niche: "",
+      outputLang: "ID",
       publicBaseUrl: "https://studio.example.com",
     });
     await saveInstagramToken(sql, "admin", {
@@ -53,5 +55,20 @@ describe("brain and settings", () => {
       }),
     ).rejects.toThrow(/Nama pengguna Instagram wajib diisi/);
     await expect(saveSettings(sql, "social_media", settings)).rejects.toThrow(/forbidden/);
+  });
+
+  it("stores niche and output language and rejects bad values", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    const base = { ...(await getSettings(sql)) };
+    expect(base.niche).toBe("");
+    expect(base.outputLang).toBe("ID");
+    await saveSettings(sql, "admin", { ...base, niche: "keuangan pribadi", outputLang: "EN" });
+    const saved = await getSettings(sql);
+    expect(saved.niche).toBe("keuangan pribadi");
+    expect(saved.outputLang).toBe("EN");
+    await expect(saveSettings(sql, "admin", { ...base, outputLang: "FR" as never })).rejects.toThrow();
+    await expect(saveSettings(sql, "admin", { ...base, niche: "x".repeat(121) })).rejects.toThrow(/Niche/);
+    await expect(saveSettings(sql, "social_media", { ...base, niche: "x" })).rejects.toThrow(/forbidden/);
   });
 });

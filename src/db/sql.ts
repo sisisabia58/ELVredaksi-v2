@@ -12,6 +12,8 @@ create table if not exists brand (
   default_format text not null default 'teaser_bio',
   default_template text not null default 'serif',
   slide_count integer not null default 3,
+  niche text not null default '',
+  output_lang text not null default 'ID' check (output_lang in ('ID','EN')),
   logo bytea,
   logo_type text,
   public_base_url text not null default 'http://127.0.0.1:43123',

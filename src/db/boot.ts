@@ -230,6 +230,8 @@ async function normalizeStoredTags(sql: Sql): Promise<void> {
 
 const SCHEMA_EXTRAS = [
   "alter table brand add column if not exists slide_count integer not null default 3",
+  "alter table brand add column if not exists niche text not null default ''",
+  "alter table brand add column if not exists output_lang text not null default 'ID'",
   "alter table brand add column if not exists logo bytea",
   "alter table brand add column if not exists logo_type text",
   "alter table topics add column if not exists image_url text",
