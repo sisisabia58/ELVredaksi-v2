@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { parseCopy, type Slide } from "../agents/copywriter";
 import { analystSystem, copySystem } from "../agents/prompts";
+import { VERBATIM_MAX_WORDS, longestSharedRun } from "../agents/verbatim";
 import { scoreTopic } from "../agents/analyst";
 import { openAccessToken, isSealedAccessToken } from "../auth/token-cipher";
 import { makeShortCode } from "../domain/code";
@@ -460,18 +461,20 @@ function isUniqueViolation(error: unknown): boolean {
 
 async function loadBrandDefaults(
   sql: JobCtx["sql"],
-): Promise<{ format: string; template: string; slideCount: number; handle: string }> {
+): Promise<{ format: string; template: string; slideCount: number; handle: string; outputLang: "ID" | "EN" }> {
   const rows = await sql.rows<{
     default_format: string;
     default_template: string;
     slide_count: number;
     handle: string;
-  }>("select default_format, default_template, slide_count, handle from brand where id = 1");
+    output_lang: string;
+  }>("select default_format, default_template, slide_count, handle, output_lang from brand where id = 1");
   return {
     format: rows[0]?.default_format ?? "carousel_full",
     template: rows[0]?.default_template ?? "berita_pro",
     slideCount: clampSlideCount(rows[0]?.slide_count),
     handle: rows[0]?.handle ?? "",
+    outputLang: rows[0]?.output_lang === "EN" ? "EN" : "ID",
   };
 }
 
@@ -608,7 +611,7 @@ async function rewriteDemoReviewDraft(
   const brand = await loadBrandDefaults(ctx.sql);
   const copyResult = await llm.complete({
     purpose: "copy",
-    system: copySystem(brain, { slideCount: brand.slideCount, handle: brand.handle }),
+    system: copySystem(brain, { slideCount: brand.slideCount, handle: brand.handle, outputLang: brand.outputLang }),
     user,
   });
   await ctx.sql.rows(
@@ -668,9 +671,11 @@ export async function runCopywriter(ctx: CopywriterCtx): Promise<void> {
     excerpt: string;
     published_at: Date | null;
     state: string;
+    author: string | null;
     source_name: string;
+    source_lang: "ID" | "EN";
   }>(
-    `select t.id, t.title, t.url, t.summary, t.excerpt, t.published_at, t.state, s.name as source_name
+    `select t.id, t.title, t.url, t.summary, t.excerpt, t.published_at, t.state, t.author, s.name as source_name, s.lang as source_lang
      from topics t
      join sources s on s.id = t.source_id
      where t.id = $1`,
@@ -726,19 +731,25 @@ export async function runCopywriter(ctx: CopywriterCtx): Promise<void> {
   }
 
   const brain = await loadBrain(ctx.sql);
+  const brand = await loadBrandDefaults(ctx.sql);
   const user = [
     `Judul: ${topic.title}`,
     `URL: ${topic.url}`,
     `Sumber: ${topic.source_name}`,
+    ...(topic.author ? [`Penulis: ${topic.author}`] : []),
+    `Bahasa sumber: ${topic.source_lang}`,
+    `Bahasa output: ${brand.outputLang}`,
+    ...(topic.source_lang !== brand.outputLang
+      ? [`Terjemahkan idenya ke ${brand.outputLang === "EN" ? "bahasa Inggris" : "bahasa Indonesia"}.`]
+      : []),
     `Diterbitkan: ${formatPublished(topic.published_at)}`,
     `Ringkasan: ${topic.summary}`,
     `Cuplikan: ${topic.excerpt}`,
   ].join("\n");
 
-  const brand = await loadBrandDefaults(ctx.sql);
   const result = await llm.complete({
     purpose: "copy",
-    system: copySystem(brain, { slideCount: brand.slideCount, handle: brand.handle }),
+    system: copySystem(brain, { slideCount: brand.slideCount, handle: brand.handle, outputLang: brand.outputLang }),
     user,
   });
 
@@ -750,6 +761,10 @@ export async function runCopywriter(ctx: CopywriterCtx): Promise<void> {
   let copy: ReturnType<typeof parseCopy>;
   try {
     copy = parseCopy(result.text, topic.source_name);
+    const copyText = [...copy.slides.flatMap((slide) => [slide.headline, slide.body]), copy.caption].join(" ");
+    if (longestSharedRun(`${topic.excerpt} ${topic.summary}`, copyText) >= VERBATIM_MAX_WORDS) {
+      throw new Error("naskah menyalin sumber");
+    }
   } catch (error) {
     if (rewrite && (await topicDraftIsFrozen(ctx.sql, topicId))) {
       return;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseCopy, stripTrailingSource } from "../src/agents/copywriter";
 import { copySystem } from "../src/agents/prompts";
+import { ScriptedLlm } from "../src/llm/provider";
 import { slideBodyCharBudget } from "../src/render/fit-body";
 import { DemoLlm } from "../src/llm/provider";
 import { createTestSql } from "../src/db/client";
@@ -494,5 +495,84 @@ describe("copywriter", () => {
     expect(drafts).toHaveLength(1);
     const topic = await sql.rows<{ state: string }>("select state from topics where id = $1", [topicId]);
     expect(topic[0]?.state).toBe("drafted");
+  });
+});
+
+describe("copywriter summarize-only rules", () => {
+  it("tells the model to summarize in its own words, credit the author and use the output language", () => {
+    const id = copySystem("Brain.", { slideCount: 3, outputLang: "ID" });
+    const en = copySystem("Brain.", { slideCount: 3, outputLang: "EN" });
+    for (const prompt of [id, en]) {
+      expect(prompt).toContain("kata-katamu sendiri");
+      expect(prompt).toContain("10 kata berturut-turut");
+      expect(prompt).toContain("Penulis");
+    }
+    expect(id).toContain("bahasa Indonesia");
+    expect(id).not.toContain("English");
+    expect(en).toContain("English");
+  });
+
+  async function setup(excerpt: string, extra: { author?: string | null; lang?: "ID" | "EN"; outputLang?: "ID" | "EN" } = {}) {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await sql.rows("update brand set output_lang = $1 where id = 1", [extra.outputLang ?? "ID"]);
+    await sql.rows("insert into sources (id, name, url, lang) values ($1,$2,$3,$4)", [
+      "11111111-1111-1111-1111-111111111111", "Contoh", "https://blog.example/", extra.lang ?? "ID",
+    ]);
+    await sql.rows(
+      "insert into topics (id, source_id, title, url, excerpt, author, state, score) values ($1,$2,$3,$4,$5,$6,'passed',80)",
+      ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1", "11111111-1111-1111-1111-111111111111", "Esai", "https://blog.example/esai", excerpt, extra.author ?? null],
+    );
+    return sql;
+  }
+
+  const excerpt = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike";
+
+  function copyWithBody(body: string): string {
+    return JSON.stringify({
+      ...good,
+      slides: good.slides.map((slide, index) => (index === 1 ? { ...slide, body } : slide)),
+    });
+  }
+
+  it("rejects a draft that reuses 11 consecutive source words and accepts 9", async () => {
+    const run = (sql: Awaited<ReturnType<typeof createTestSql>>, text: string) =>
+      runCopywriter({
+        sql,
+        payload: { topicId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1" },
+        manual: true,
+        now: new Date("2026-10-28T02:00:00Z"),
+        llm: new ScriptedLlm([text]),
+      });
+    const bad = await setup(excerpt);
+    await run(bad, copyWithBody("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo."));
+    expect(await bad.rows("select id from drafts")).toHaveLength(0);
+    const failed = await bad.rows<{ state: string; error: string }>("select state, error from topics");
+    expect(failed[0]).toMatchObject({ state: "failed", error: "naskah menyalin sumber" });
+
+    const ok = await setup(excerpt);
+    await run(ok, copyWithBody("alpha bravo charlie delta echo foxtrot golf hotel india."));
+    expect(await ok.rows("select id from drafts")).toHaveLength(1);
+  });
+
+  it("sends author, languages and a translate instruction to the model", async () => {
+    const sql = await setup("isi", { author: "Dina", lang: "EN", outputLang: "ID" });
+    const seen: string[] = [];
+    await runCopywriter({
+      sql,
+      payload: { topicId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1" },
+      manual: true,
+      now: new Date("2026-10-28T02:00:00Z"),
+      llm: {
+        async complete(req: { user: string }) {
+          seen.push(req.user);
+          return { text: JSON.stringify(good), costUsd: 0, model: "x" };
+        },
+      },
+    });
+    expect(seen[0]).toContain("Penulis: Dina");
+    expect(seen[0]).toContain("Bahasa sumber: EN");
+    expect(seen[0]).toContain("Bahasa output: ID");
+    expect(seen[0]).toContain("Terjemahkan");
   });
 });
