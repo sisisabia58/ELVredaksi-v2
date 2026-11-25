@@ -103,6 +103,10 @@ create table if not exists drafts (
   short_code text not null unique,
   click_count integer not null default 0,
   manual boolean not null default false,
+  cover_image bytea,
+  cover_type text,
+  cover_ai boolean not null default false,
+  cover_pending boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -203,6 +207,12 @@ create table if not exists gemini_gate (
 
 -- Automatic designer renders started per WIB day (MAX_IMAGE_GENERATIONS_PER_DAY).
 create table if not exists render_quota (
+  day date primary key,
+  used integer not null default 0
+);
+
+-- AI covers generated per WIB day (MAX_AI_COVERS_PER_DAY).
+create table if not exists cover_quota (
   day date primary key,
   used integer not null default 0
 );

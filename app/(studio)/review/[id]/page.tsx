@@ -54,6 +54,7 @@ export default async function ReviewEditorPage({ params }: PageParams) {
         shortCode: draft.shortCode,
         clickCount: draft.clickCount,
         textDirty: draft.textDirty,
+        coverPending: draft.coverPending,
         sensitive: draft.sensitive,
         score: draft.score,
         sourceName: draft.sourceName,

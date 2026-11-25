@@ -60,6 +60,7 @@ export type DraftDetail = {
   shortCode: string;
   clickCount: number;
   textDirty: boolean;
+  coverPending: boolean;
   sensitive: boolean;
   score: number | null;
   sourceName: string;
@@ -89,6 +90,8 @@ type DraftRow = {
   short_code: string;
   click_count: number;
   text_dirty: boolean;
+  cover_ai: boolean;
+  cover_pending: boolean;
   manual: boolean;
   scheduled_at: Date | null;
   posted_at: Date | null;
@@ -152,6 +155,12 @@ function blockIfDirty(textDirty: boolean): void {
   }
 }
 
+function blockIfCoverPending(coverPending: boolean): void {
+  if (coverPending) {
+    throw new Error("Cover AI sedang dibuat. Coba lagi sebentar lagi.");
+  }
+}
+
 type LockedDraftRow = {
   id: string;
   status: DraftStatus;
@@ -212,6 +221,7 @@ async function loadDraftRow(sql: Sql, id: string): Promise<DraftRow> {
   const rows = await sql.rows<DraftRow>(
     `select d.id, d.topic_id, d.status, d.format, d.template, d.slides, d.caption, d.hashtags,
             d.alt_headlines, d.focal_y, d.short_code, d.click_count, d.text_dirty, d.manual,
+            d.cover_ai, d.cover_pending,
             d.scheduled_at, d.error,
             t.score, t.sensitive, s.name as source_name, b.handle
      from drafts d
@@ -291,6 +301,7 @@ export async function getDraft(sql: Sql, id: string): Promise<DraftDetail | null
   const rows = await sql.rows<DraftRow & { updated_at: Date }>(
     `select d.id, d.topic_id, d.status, d.format, d.template, d.slides, d.caption, d.hashtags,
             d.alt_headlines, d.focal_y, d.short_code, d.click_count, d.text_dirty, d.manual,
+            d.cover_pending,
             d.scheduled_at, d.posted_at, d.ig_permalink, d.ig_media_id, d.error, d.updated_at,
             t.score, t.sensitive, t.url as topic_url, s.name as source_name, b.handle,
             b.slide_count
@@ -333,6 +344,7 @@ export async function getDraft(sql: Sql, id: string): Promise<DraftDetail | null
     shortCode: row.short_code,
     clickCount: row.click_count,
     textDirty: row.text_dirty,
+    coverPending: row.cover_pending,
     sensitive: row.sensitive,
     score: row.score,
     sourceName: row.source_name,
@@ -521,6 +533,30 @@ export async function approveDraftInTx(tx: Sql, role: Role, id: string): Promise
   if (!updated[0]) {
     await failPublishWrite(tx, id);
   }
+  await queueAiCover(tx, id, row);
+}
+
+/** After a human approves, ask for one AI cover unless the draft already has one or the operator uploaded a photo. */
+async function queueAiCover(tx: Sql, id: string, row: DraftRow): Promise<void> {
+  if (row.cover_ai) {
+    return;
+  }
+  const slides = parseSlides(row.slides);
+  const cover = (slides.find((slide) => slide.role === "cover") ?? slides[0]) as SlideWithPhoto | undefined;
+  if (cover?.photoDataUrl) {
+    return;
+  }
+  const open = await tx.rows<{ id: string }>(
+    `select id from jobs
+     where name = 'designer.cover' and finished_at is null and payload->>'draftId' = $1
+     limit 1`,
+    [id],
+  );
+  if (open.length > 0) {
+    return;
+  }
+  await tx.rows(`update drafts set cover_pending = true where id = $1`, [id]);
+  await enqueue(tx, { name: "designer.cover", payload: { draftId: id }, runAt: new Date() });
 }
 
 export async function approveDraft(sql: Sql, role: Role, id: string): Promise<void> {
@@ -557,6 +593,7 @@ export async function scheduleDraftInTx(
   await assertLiveConnection(tx);
   const row = await loadDraftRow(tx, id);
   blockIfDirty(row.text_dirty);
+  blockIfCoverPending(row.cover_pending);
   blockIfPlaceholder(parseSlides(row.slides));
   if (scheduledAt.getTime() <= Date.now()) {
     throw new Error("Jadwal harus di masa depan");
@@ -649,6 +686,7 @@ export async function postDraftNow(sql: Sql, role: Role, id: string): Promise<vo
   await assertLiveConnection(sql);
   const row = await loadDraftRow(sql, id);
   blockIfDirty(row.text_dirty);
+  blockIfCoverPending(row.cover_pending);
   blockIfPlaceholder(parseSlides(row.slides));
   const now = new Date();
   if (row.status === "needs_review") {

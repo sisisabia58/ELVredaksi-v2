@@ -34,6 +34,8 @@ import { normalizeInsights, type DailyPoint } from "../studio/analytics";
 import { validateCoverPhotoDataUrl, withLockedDraftEdit } from "../studio/drafts";
 import { enqueue, type JobCtx } from "./runner";
 import { autoRendersUsed, maxAutoRendersPerDay, reserveAutoRender } from "./render-quota";
+import { maxAiCoversPerDay, reserveAiCover } from "./cover-quota";
+import { createImageProvider, type ImageProvider } from "../image/provider";
 
 export type ScoutCtx = JobCtx & {
   fetchFeed: (url: string) => Promise<string>;
@@ -946,9 +948,12 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
     slide_count: number;
     logo: unknown;
     logo_type: string | null;
+    cover_image: unknown;
+    cover_type: string | null;
     updated_at: Date;
   }>(
     `select d.status, d.format, d.template, d.slides, d.focal_y, d.updated_at,
+            d.cover_image, d.cover_type,
             s.name as source_name, b.handle, b.accent, b.initial,
             b.slide_count, b.logo, b.logo_type
      from drafts d
@@ -1010,7 +1015,12 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
         const slide = selected[index];
         const shot = photoInputForSlide(slide, draft.focal_y);
         const focalY = shot.focalY;
-        const photoDataUrl = shot.photoDataUrl;
+        let photoDataUrl = shot.photoDataUrl;
+        let aiCover = false;
+        if (index === 0 && !photoDataUrl && draft.cover_image) {
+          photoDataUrl = safePhotoDataUrl(dataUrlFromBytes(draft.cover_image, draft.cover_type ?? ""));
+          aiCover = photoDataUrl !== null;
+        }
         const html = renderSlideHtml({
           template,
           slide,
@@ -1021,6 +1031,7 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
           accent: draft.accent,
           focalY,
           photoDataUrl,
+          aiCover,
           logoDataUrl,
           initial: draft.initial,
         });
@@ -1093,6 +1104,104 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
 }
 
 
+export type CoverCtx = JobCtx & { imageProvider?: ImageProvider };
+
+/**
+ * Makes the AI cover for a draft a person already approved. Every outcome clears
+ * cover_pending and queues one manual re-render, so a failed or capped cover falls
+ * back to the geometric one instead of leaving the draft stuck.
+ */
+export async function runCoverJob(ctx: CoverCtx): Promise<void> {
+  const draftId = ctx.payload.draftId;
+  if (typeof draftId !== "string" || !draftId) {
+    throw new Error("draft tidak ditemukan");
+  }
+  const rows = await ctx.sql.rows<{
+    status: string;
+    slides: Slide[] | string;
+    cover_ai: boolean;
+    niche: string;
+    accent: string;
+  }>(
+    `select d.status, d.slides, d.cover_ai, b.niche, b.accent
+     from drafts d cross join brand b
+     where d.id = $1 and b.id = 1`,
+    [draftId],
+  );
+  const draft = rows[0];
+  if (!draft) {
+    return;
+  }
+
+  const finish = async (rerender: boolean) => {
+    await ctx.sql.rows(`update drafts set cover_pending = false where id = $1`, [draftId]);
+    if (rerender) {
+      await enqueue(ctx.sql, { name: "designer.render", payload: { draftId }, runAt: ctx.now, manual: true });
+    }
+  };
+
+  if (draft.status === "posting" || draft.status === "posted" || draft.status === "simulasi") {
+    await finish(false);
+    return;
+  }
+  if (draft.cover_ai) {
+    await finish(false);
+    return;
+  }
+
+  const slides = asSlides(draft.slides);
+  const cover = slides.find((slide) => slide.role === "cover") ?? slides[0];
+  const headline = cover?.headline ?? "draft";
+  const note = async (message: string) => {
+    await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+      randomUUID(),
+      "designer",
+      message,
+    ]);
+  };
+
+  const cap = maxAiCoversPerDay();
+  if (!(await reserveAiCover(ctx.sql, ctx.now, cap))) {
+    await note(
+      cap === 0
+        ? `Cover AI dimatikan (MAX_AI_COVERS_PER_DAY=0), "${headline}" memakai cover geometris`
+        : `Batas ${cap} cover AI hari ini tercapai, "${headline}" memakai cover geometris`,
+    );
+    await finish(true);
+    return;
+  }
+
+  try {
+    const provider = ctx.imageProvider ?? createImageProvider();
+    const result = await provider.cover({
+      headline,
+      kicker: cover?.kicker ?? "",
+      niche: draft.niche,
+      accent: draft.accent,
+    });
+    await ctx.sql.tx(async (tx) => {
+      await tx.rows(
+        `update drafts set cover_image = $1, cover_type = $2, cover_ai = true, cover_pending = false
+         where id = $3`,
+        [Buffer.from(result.bytes), result.contentType, draftId],
+      );
+      await tx.rows(`insert into llm_spend (id, agent, model, cost_usd) values ($1, $2, $3, $4)`, [
+        randomUUID(),
+        "designer",
+        result.model,
+        result.costUsd,
+      ]);
+    });
+    await note(`Cover AI selesai untuk "${headline}"`);
+    await finish(true);
+  } catch (error) {
+    const detail = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+    console.warn(`[designer] AI cover failed for draft ${draftId}: ${detail}`);
+    await note(`Cover AI gagal untuk "${headline}", memakai cover geometris`);
+    await finish(true);
+  }
+}
+
 function asStringArray(raw: unknown): string[] {
   if (Array.isArray(raw)) {
     return raw.filter((item): item is string => typeof item === "string");
@@ -1133,6 +1242,7 @@ export async function runPublisher(ctx: JobCtx & { publisher?: Publisher; fetchI
     template: string;
     slide_count: number | null;
     share_to_story: boolean;
+    cover_ai: boolean;
     topic_url: string;
     source_name: string;
     public_base_url: string | null;
@@ -1144,7 +1254,7 @@ export async function runPublisher(ctx: JobCtx & { publisher?: Publisher; fetchI
     story_media_id: string | null;
     story_error: string | null;
   }>(
-    `select d.status, d.caption, d.hashtags, d.slides, d.format, d.template, d.share_to_story,
+    `select d.status, d.caption, d.hashtags, d.slides, d.format, d.template, d.share_to_story, d.cover_ai,
             t.url as topic_url, s.name as source_name,
             b.public_base_url, b.slide_count,
             i.ig_user_id, i.access_token, i.api_host, i.token_error,
@@ -1262,7 +1372,7 @@ export async function runPublisher(ctx: JobCtx & { publisher?: Publisher; fetchI
     });
     const altTexts = assets.map((asset) => selected[asset.slide_index]?.headline ?? "");
     const hashtags = asStringArray(draft.hashtags);
-    const caption = `${draft.caption}\n\n${hashtags.map((tag) => `#${tag}`).join(" ")}`;
+    const caption = `${draft.caption}\n\n${hashtags.map((tag) => `#${tag}`).join(" ")}${draft.cover_ai ? "\n\nCover: ilustrasi AI." : ""}`;
     result = await publisher.publish({
       igUserId: draft.ig_user_id ?? "",
       accessToken,
@@ -1759,6 +1869,7 @@ export const jobHandlers = {
   "analyst.score": runAnalyst,
   "copywriter.write": runCopywriter,
   "designer.render": runDesigner,
+  "designer.cover": runCoverJob,
   "publisher.publish": runPublisher,
   "insights.sync": runInsights,
   "ig.refresh": runInstagramRefresh,

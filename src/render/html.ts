@@ -20,6 +20,7 @@ export type RenderSlideInput = {
   photoDataUrl: string | null;
   logoDataUrl?: string | null;
   initial?: string;
+  aiCover?: boolean;
 };
 
 const PALETTE = ["#14171c", "#f6ee5f", "#ffffff"] as const;
@@ -166,7 +167,19 @@ function renderCatatan(input: RenderSlideInput): string {
 </section>`);
 }
 
+const AI_BADGE =
+  '<div style="position:fixed;right:28px;bottom:28px;z-index:99;padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.62);color:#fff;font:600 22px/1 Inter,sans-serif;letter-spacing:0.02em;">Ilustrasi AI</div>';
+
+/** Slide 1 of a draft whose cover was drawn by AI carries a visible label. */
 export function renderSlideHtml(input: RenderSlideInput): string {
+  const html = renderTemplateHtml(input);
+  if (!input.aiCover || input.index !== 0) {
+    return html;
+  }
+  return html.replace(/<\/body>/i, `${AI_BADGE}</body>`);
+}
+
+function renderTemplateHtml(input: RenderSlideInput): string {
   switch (input.template) {
     case "stabilo":
       return renderStabilo(input);

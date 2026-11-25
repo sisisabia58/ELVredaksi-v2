@@ -10,6 +10,7 @@ export type JobName =
   | "analyst.score"
   | "copywriter.write"
   | "designer.render"
+  | "designer.cover"
   | "publisher.publish"
   | "insights.sync"
   | "ig.refresh";

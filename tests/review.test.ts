@@ -33,6 +33,8 @@ import {
 } from "../src/studio/drafts";
 import type { Sql } from "../src/db/client";
 import { enqueue } from "../src/jobs/runner";
+import { runCoverJob } from "../src/jobs/handlers";
+import { DemoImageProvider } from "../src/image/provider";
 
 const DRAFT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb1";
 const TOPIC_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1";
@@ -353,6 +355,14 @@ describe("review", () => {
     });
     const when = new Date(Date.now() + 3_600_000);
     await approveDraft(sql, "social_media", DRAFT_ID);
+    // Approving queues an AI cover; scheduling waits until the cover job has finished.
+    await runCoverJob({
+      sql,
+      payload: { draftId: DRAFT_ID },
+      manual: false,
+      now: new Date(),
+      imageProvider: new DemoImageProvider(),
+    });
     await scheduleDraft(sql, "social_media", DRAFT_ID, when);
     await postDraftNow(sql, "social_media", DRAFT_ID);
     expect(await readDraft(sql, DRAFT_ID)).toMatchObject({

@@ -60,6 +60,7 @@ type DraftView = {
   shortCode: string;
   clickCount: number;
   textDirty: boolean;
+  coverPending: boolean;
   sensitive: boolean;
   score: number | null;
   sourceName: string;
@@ -162,14 +163,14 @@ export function EditorPanel({
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   useEffect(() => {
-    if (!draft.textDirty) {
+    if (!draft.textDirty && !draft.coverPending) {
       return;
     }
     const timer = window.setInterval(() => {
       router.refresh();
     }, 4000);
     return () => window.clearInterval(timer);
-  }, [draft.textDirty, draft.id, router]);
+  }, [draft.textDirty, draft.coverPending, draft.id, router]);
   const [previewTab, setPreviewTab] = useState<"render" | "focal">("render");
   const [slideIndex, setSlideIndex] = useState(0);
   const initialFields = editorTextFields(draft, 0);
@@ -572,6 +573,9 @@ export function EditorPanel({
           ) : null}
           {publishBlocked && !awaitsRewrite ? (
             <p className="text-sm text-amber-200">Render dulu teks yang baru</p>
+          ) : null}
+          {draft.coverPending ? (
+            <p className="text-sm text-amber-200">Cover AI sedang dibuat…</p>
           ) : null}
 
           <div className="flex flex-wrap gap-2">
