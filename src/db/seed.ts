@@ -6,7 +6,7 @@ const BRAIN_DOCS: { slug: string; title: string; body: string }[] = [
   {
     slug: "00-baca-dulu",
     title: "Baca dulu",
-    body: "Analis dan Copywriter membaca semua catatan ini setiap kali bekerja. Ubah gaya, ambang viral, dan larangan di sini. Jangan tempel artikel orang lain.",
+    body: "Analis dan Copywriter membaca semua catatan ini setiap kali bekerja. Ubah gaya, kriteria perspektif, dan larangan di sini. Jangan tempel tulisan orang lain.",
   },
   {
     slug: "01-brand-voice",
@@ -21,7 +21,7 @@ const BRAIN_DOCS: { slug: string; title: string; body: string }[] = [
   {
     slug: "03-aturan-caption",
     title: "Aturan caption",
-    body: "Caption 2–4 kalimat plus 3–8 hashtag tanpa tanda pagar di data. Sebut nama sumber.",
+    body: "Caption 2–4 kalimat plus 3–8 hashtag tanpa tanda pagar di data. Sebut nama sumber dan nama penulis bila ada. Ringkas dengan kata sendiri, jangan menyalin kalimat.",
   },
   {
     slug: "04-topik-sensitif",
@@ -31,7 +31,7 @@ const BRAIN_DOCS: { slug: string; title: string; body: string }[] = [
   {
     slug: "05-contoh-post",
     title: "Contoh post",
-    body: "Hook satu napas, satu fakta per slide, slide terakhir ajakan atau pendapat.",
+    body: "Hook satu napas, satu gagasan per slide, slide terakhir ajakan atau pendapat.",
   },
   {
     slug: "06-aturan-carousel",

@@ -20,8 +20,8 @@ const SLIDES: { kicker: string; title: string; body: string }[] = [
   },
   {
     kicker: "Sumber",
-    title: "RSS yang kamu pegang sendiri",
-    body: "Setiap sumber punya nama, URL, dan bahasa Indonesia atau Inggris. Setiap topik menyimpan tautan artikel. Setiap slide menuliskan nama sumber di bagian bawah.",
+    title: "RSS dan crawl yang kamu pegang sendiri",
+    body: "Setiap sumber punya nama, URL, dan bahasa Indonesia atau Inggris, berupa feed RSS atau halaman daftar yang di-crawl. Setiap topik menyimpan tautan artikel. Setiap slide menuliskan nama sumber di bagian bawah.",
   },
   {
     kicker: "Brain",
@@ -31,7 +31,7 @@ const SLIDES: { kicker: string; title: string; body: string }[] = [
   {
     kicker: "Radar",
     title: "Skor sebelum jadi naskah",
-    body: "Lima aspek, masing-masing 0 sampai 20. Lolos pada 70. Topik sensitif tetap bisa lolos dan ditandai supaya tim mengecek risiko. Yang lolos bisa diminta jadi konten.",
+    body: "Lima aspek perspektif, masing-masing 0 sampai 20. Lolos pada 70. Topik sensitif tetap bisa lolos dan ditandai supaya tim mengecek risiko. Yang lolos bisa diminta jadi konten.",
   },
   {
     kicker: "Overview",

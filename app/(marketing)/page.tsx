@@ -22,16 +22,16 @@ const PAIRS = [
   {
     problem: "Topik habis sebelum jam posting tiba",
     answer:
-      "Scout membaca RSS yang kamu daftarkan dan menaruh judul baru beserta tautan artikel aslinya.",
+      "Scout membaca RSS yang kamu daftarkan, atau meng-crawl halaman daftar artikel yang tidak punya feed, lalu menaruh judul baru beserta tautan aslinya.",
   },
   {
     problem: "Naskah carousel ditulis dari nol setiap kali",
-    answer: "Copywriter menyusun slide, caption, dan hashtag dari cuplikan serta catatan di Brain.",
+    answer: "Copywriter meringkas sudut pandang penulis dengan kata sendiri, lalu menyusun slide, caption, dan hashtag dari catatan di Brain.",
   },
   {
     problem: "Ukuran gambar berganti-ganti",
     answer:
-      "Designer merender slide 1080×1350. Template Berita Pro memakai foto artikel dan menulis kredit sumber. Template lain tetap grafis atau unggahan operator.",
+      "Designer merender slide 1080×1350. Sampul dibuat AI setelah naskah disetujui dan diberi label Ilustrasi AI. Slide lain memakai template, dengan kredit sumber.",
   },
   {
     problem: "Posting jalan tanpa ada yang meninjau",
@@ -44,27 +44,27 @@ const AGENTS = [
   {
     name: "Scout",
     color: "var(--scout)",
-    body: "Mengambil judul dari sumber yang kamu pegang. Setiap topik menyimpan URL dan nama media.",
+    body: "Mengambil esai dan artikel opini dari sumber yang kamu pegang. Setiap topik menyimpan URL, nama sumber, dan penulis bila ada.",
   },
   {
     name: "Analis",
     color: "var(--analis)",
-    body: "Menilai lima aspek. Lolos pada 70. Topik sensitif ditandai supaya tim yang mengecek.",
+    body: "Menilai lima aspek perspektif: tesis, sudut, relevansi, kutipan, orisinalitas. Lolos pada 70. Topik sensitif ditandai supaya tim yang mengecek.",
   },
   {
     name: "Copywriter",
     color: "var(--copywriter)",
-    body: "Menulis slide dan caption dengan gaya yang tersimpan di Brain, lalu menyebut nama sumber.",
+    body: "Meringkas dengan kata sendiri, memakai gaya yang tersimpan di Brain, lalu menyebut sumber dan penulis.",
   },
   {
     name: "Designer",
     color: "var(--designer)",
-    body: "Merender template menjadi PNG 1080×1350. Berita Pro memakai foto artikel. Template lain dibuat di aplikasi atau diunggah operator.",
+    body: "Merender template menjadi PNG 1080×1350. Sampul bisa dibuat AI (berlabel Ilustrasi AI) atau diunggah operator. Foto dari artikel tidak dipakai.",
   },
 ] as const;
 
 const AUDIENCES = [
-  "Media & portal berita",
+  "Kurator perspektif & newsletter",
   "Brand & UMKM",
   "Agency",
   "Instansi & kampus",
@@ -125,10 +125,10 @@ export default function MarketingPage() {
         <section className="px-5 py-12">
           <h2 className="text-2xl font-semibold">Teaser dua slide, dengan kredit sumber</h2>
           <p className="mt-3 text-base leading-relaxed text-[var(--sale-muted)]">
-            Format pendek berisi sampul dan ajakan ke tautan bio. Template Berita Pro mengunduh
-            foto dari artikel sumber, menyimpannya di cache, dan menulis kredit. Template lain
-            tetap grafis atau unggahan operator. Setiap slide mencantumkan nama sumber. Klik di
-            halaman bio dihitung, lalu pembaca diarahkan ke artikel aslinya.
+            Format pendek berisi sampul dan ajakan ke tautan bio. Sampul bisa dibuat AI setelah
+            kamu menyetujui naskah dan selalu berlabel Ilustrasi AI. Foto dari artikel sumber tidak
+            diunduh. Setiap slide mencantumkan nama sumber. Klik di halaman bio dihitung, lalu
+            pembaca diarahkan ke tulisan aslinya.
           </p>
         </section>
 
