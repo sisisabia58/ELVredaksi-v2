@@ -13,7 +13,7 @@ import { totalScore, verdict } from "../src/domain/score";
 import { deltaPct, engagementRate, formatUsd } from "../src/domain/metrics";
 import { makeShortCode } from "../src/domain/code";
 
-const even = { relevansi: 20, emosi: 20, kebaruan: 20, timing: 10, shareability: 10 };
+const even = { tesis: 20, sudut: 20, relevansi: 20, kutipan: 10, orisinalitas: 10 };
 
 describe("draft gate", () => {
   it("lets a worker publish only a draft a human already scheduled", () => {
@@ -83,7 +83,7 @@ describe("score and metrics", () => {
     expect(totalScore(even)).toBe(80);
     expect(verdict(80, 70)).toBe("lolos");
     expect(verdict(69, 70)).toBe("dilewati");
-    expect(() => totalScore({ ...even, relevansi: 21 })).toThrow(/0-20/);
+    expect(() => totalScore({ ...even, tesis: 21 })).toThrow(/tesis must be an integer 0-20/);
   });
 
   it("formats ER, follower-style percents, and USD like the studio", () => {

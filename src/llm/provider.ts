@@ -43,11 +43,11 @@ function demoScorePayload(user: string): Record<string, unknown> {
   const aspect = low ? 8 : 16;
   return {
     aspects: {
+      tesis: aspect,
+      sudut: aspect,
       relevansi: aspect,
-      emosi: aspect,
-      kebaruan: aspect,
-      timing: aspect,
-      shareability: aspect,
+      kutipan: aspect,
+      orisinalitas: aspect,
     },
     tags: ["marketing"],
     sensitive,
@@ -144,13 +144,13 @@ const SCORE_RESPONSE_SCHEMA = {
     aspects: {
       type: "OBJECT",
       properties: {
+        tesis: { type: "INTEGER" },
+        sudut: { type: "INTEGER" },
         relevansi: { type: "INTEGER" },
-        emosi: { type: "INTEGER" },
-        kebaruan: { type: "INTEGER" },
-        timing: { type: "INTEGER" },
-        shareability: { type: "INTEGER" },
+        kutipan: { type: "INTEGER" },
+        orisinalitas: { type: "INTEGER" },
       },
-      required: ["relevansi", "emosi", "kebaruan", "timing", "shareability"],
+      required: ["tesis", "sudut", "relevansi", "kutipan", "orisinalitas"],
     },
     tags: { type: "ARRAY", items: { type: "STRING" } },
     sensitive: { type: "BOOLEAN" },

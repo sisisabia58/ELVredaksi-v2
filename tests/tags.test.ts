@@ -26,7 +26,7 @@ describe("categories", () => {
   it("normalizes tags that come back from the model", () => {
     const scored = scoreTopic(
       JSON.stringify({
-        aspects: { relevansi: 16, emosi: 16, kebaruan: 16, timing: 16, shareability: 16 },
+        aspects: { tesis: 16, sudut: 16, relevansi: 16, kutipan: 16, orisinalitas: 16 },
         tags: ["EKspansi Global"],
         sensitive: false,
         sensitiveReason: null,

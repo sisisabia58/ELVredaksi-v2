@@ -38,7 +38,7 @@ const newCopy = {
 };
 
 const newScore = {
-  aspects: { relevansi: 18, emosi: 17, kebaruan: 16, timing: 15, shareability: 14 },
+  aspects: { tesis: 18, sudut: 17, relevansi: 16, kutipan: 15, orisinalitas: 14 },
   tags: ["EKspansi Global"],
   sensitive: false,
   sensitiveReason: null,

@@ -6,11 +6,11 @@ const aspectField = z.number().int().min(0).max(20);
 
 export const scoreSchema = z.object({
   aspects: z.object({
+    tesis: aspectField,
+    sudut: aspectField,
     relevansi: aspectField,
-    emosi: aspectField,
-    kebaruan: aspectField,
-    timing: aspectField,
-    shareability: aspectField,
+    kutipan: aspectField,
+    orisinalitas: aspectField,
   }),
   tags: z.array(z.string().max(40)).max(4),
   sensitive: z.boolean(),

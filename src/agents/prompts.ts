@@ -12,13 +12,24 @@ import {
 } from "./copy-limits";
 import { slideBodyCharBudget } from "../render/fit-body";
 
-export function analystSystem(brain: string): string {
-  return `Kamu adalah analis redaksi. Baca brain berikut dan nilai cuplikan berita.
+export function analystSystem(brain: string, options?: { niche?: string }): string {
+  const niche = options?.niche?.trim() ?? "";
+  const nicheLine = niche
+    ? `Niche channel ini: ${niche}. Nilai "relevansi" terhadap niche itu.`
+    : 'Niche channel belum diisi. Nilai "relevansi" untuk audiens umum yang suka sudut pandang.';
+  return `Kamu adalah analis redaksi. Baca brain berikut dan nilai esai atau artikel opini yang akan diringkas menjadi carousel.
 
 ${brain}
 
+${nicheLine}
+
 Kembalikan hanya JSON dengan field wajib berikut:
-- aspects: object dengan lima bilangan bulat 0–20 — relevansi, emosi, kebaruan, timing, shareability
+- aspects: object dengan lima bilangan bulat 0–20:
+  - tesis: tesis utama bisa dinyatakan dalam satu kalimat dan jelas
+  - sudut: sudut pandang tidak biasa atau berlawanan dengan anggapan umum
+  - relevansi: cocok dengan niche channel
+  - kutipan: ada kalimat yang layak dikutip dan muat di slide
+  - orisinalitas: bukan informasi generik yang ada di mana-mana
 - tags: array 0–4 string pendek (contoh tema)
 - sensitive: boolean
 - sensitiveReason: string penjelasan jika sensitif, atau null
@@ -28,7 +39,7 @@ Kembalikan hanya JSON dengan field wajib berikut:
 Jangan sertakan fakta yang tidak ada di cuplikan. Set sensitive sesuai dokumen 04 (topik sensitif).
 
 Contoh JSON valid:
-{"aspects":{"relevansi":16,"emosi":14,"kebaruan":12,"timing":15,"shareability":13},"tags":["marketing"],"sensitive":false,"sensitiveReason":null,"blocked":false,"reason":"Relevan untuk audiens marketing."}`;
+{"aspects":{"tesis":16,"sudut":14,"relevansi":15,"kutipan":12,"orisinalitas":13},"tags":["opini"],"sensitive":false,"sensitiveReason":null,"blocked":false,"reason":"Tesis jelas dan sudutnya tidak biasa."}`;
 }
 
 export function copySystem(

@@ -246,6 +246,11 @@ async function loadPassThreshold(sql: JobCtx["sql"]): Promise<number> {
   return rows[0]?.pass_threshold ?? PASS_THRESHOLD_DEFAULT;
 }
 
+async function loadNiche(sql: JobCtx["sql"]): Promise<string> {
+  const rows = await sql.rows<{ niche: string }>("select niche from brand where id = 1");
+  return rows[0]?.niche ?? "";
+}
+
 async function loadBrain(sql: JobCtx["sql"]): Promise<string> {
   const docs = await sql.rows<{ title: string; body: string }>(
     "select title, body from brain_docs order by slug",
@@ -273,9 +278,10 @@ async function scoreOneTopic(
     excerpt: string;
     published_at: Date | null;
     state: string;
+    author: string | null;
     source_name: string;
   }>(
-    `select t.id, t.title, t.url, t.summary, t.excerpt, t.published_at, t.state, s.name as source_name
+    `select t.id, t.title, t.url, t.summary, t.excerpt, t.published_at, t.state, t.author, s.name as source_name
      from topics t
      join sources s on s.id = t.source_id
      where t.id = $1`,
@@ -291,6 +297,7 @@ async function scoreOneTopic(
     `Judul: ${topic.title}`,
     `URL: ${topic.url}`,
     `Sumber: ${topic.source_name}`,
+    ...(topic.author ? [`Penulis: ${topic.author}`] : []),
     `Diterbitkan: ${formatPublished(topic.published_at)}`,
     `Ringkasan: ${topic.summary}`,
     `Cuplikan: ${topic.excerpt}`,
@@ -298,7 +305,7 @@ async function scoreOneTopic(
 
   const result = await llm.complete({
     purpose: "score",
-    system: analystSystem(brain),
+    system: analystSystem(brain, { niche: await loadNiche(ctx.sql) }),
     user,
   });
 
@@ -554,7 +561,7 @@ async function rewriteDemoReviewDraft(
   if (await topicNeedsFreshScore(ctx.sql, topic.id)) {
     const scoredResult = await llm.complete({
       purpose: "score",
-      system: analystSystem(brain),
+      system: analystSystem(brain, { niche: await loadNiche(ctx.sql) }),
       user,
     });
     await ctx.sql.rows(

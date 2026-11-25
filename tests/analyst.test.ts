@@ -4,7 +4,79 @@ import { scoreTopic } from "../src/agents/analyst";
 import { createTestSql } from "../src/db/client";
 import { seedDefaults } from "../src/db/seed";
 import { runAnalyst } from "../src/jobs/handlers";
+import { analystSystem } from "../src/agents/prompts";
 import { listTopics } from "../src/studio/topics";
+
+describe("perspective rubric", () => {
+  const valid = {
+    aspects: { tesis: 16, sudut: 15, relevansi: 14, kutipan: 13, orisinalitas: 12 },
+    tags: ["opini"],
+    sensitive: false,
+    sensitiveReason: null,
+    blocked: false,
+    reason: "Tesis jelas.",
+  };
+
+  it("accepts the five perspective aspects and rejects the old news keys", () => {
+    expect(scoreTopic(JSON.stringify(valid)).aspects.tesis).toBe(16);
+    expect(() =>
+      scoreTopic(
+        JSON.stringify({
+          ...valid,
+          aspects: { relevansi: 16, emosi: 16, kebaruan: 16, timing: 16, shareability: 16 },
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("names the niche and the five aspects, and drops the news rubric", () => {
+    const prompt = analystSystem("brain", { niche: "keuangan pribadi" });
+    expect(prompt).toContain("keuangan pribadi");
+    for (const key of ["tesis", "sudut", "relevansi", "kutipan", "orisinalitas"]) {
+      expect(prompt).toContain(key);
+    }
+    expect(prompt).not.toContain("shareability");
+  });
+
+  it("scores the demo payload with the new keys", async () => {
+    const result = await new DemoLlm().complete({ purpose: "score", system: "", user: "Judul: x" });
+    expect(scoreTopic(result.text).aspects).toMatchObject({ tesis: 16 });
+  });
+});
+
+describe("analyst input", () => {
+  it("sends the author and the brand niche to the model", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await sql.rows("update brand set niche = 'keuangan pribadi' where id = 1");
+    await sql.rows("insert into sources (id, name, url, lang) values ($1,$2,$3,$4)", [
+      "11111111-1111-1111-1111-111111111111",
+      "Blog",
+      "https://blog.example/",
+      "EN",
+    ]);
+    await sql.rows(
+      "insert into topics (id, source_id, title, url, summary, author) values ($1,$2,$3,$4,$5,$6)",
+      ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1", "11111111-1111-1111-1111-111111111111", "Esai", "https://blog.example/esai", "c", "Dina"],
+    );
+    const seen: { system: string; user: string }[] = [];
+    const llm = {
+      async complete(req: { system: string; user: string }) {
+        seen.push(req);
+        return new DemoLlm().complete({ purpose: "score", system: req.system, user: req.user });
+      },
+    };
+    await runAnalyst({
+      sql,
+      payload: { topicId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1" },
+      manual: true,
+      now: new Date(),
+      llm,
+    });
+    expect(seen[0]?.user).toContain("Penulis: Dina");
+    expect(seen[0]?.system).toContain("keuangan pribadi");
+  });
+});
 
 describe("analyst", () => {
   it("rejects a score that is not five integers", () => {

@@ -15,8 +15,8 @@ const BRAIN_DOCS: { slug: string; title: string; body: string }[] = [
   },
   {
     slug: "02-kriteria-viral",
-    title: "Kriteria viral",
-    body: "Skor lima aspek, masing-masing bilangan bulat 0–20: Relevansi (marketing, iklan, media sosial, AI untuk marketing tinggi; gosip, kripto, dan politik rendah), Emosi, Kebaruan (fitur atau rilis, bukan opini daur ulang), Timing (turun setelah 48 jam), Shareability. Lolos pada 70. Sertakan tag singkat.",
+    title: "Kriteria perspektif",
+    body: "Skor lima aspek, masing-masing bilangan bulat 0–20: Tesis (satu kalimat yang jelas), Sudut (tidak biasa atau berlawanan dengan anggapan umum), Relevansi (cocok dengan niche channel), Kutipan (ada kalimat yang layak dikutip dan muat di slide), Orisinalitas (bukan informasi generik yang ada di mana-mana). Lolos pada 70. Sertakan tag singkat.",
   },
   {
     slug: "03-aturan-caption",

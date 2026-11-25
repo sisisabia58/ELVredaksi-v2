@@ -1,12 +1,12 @@
 export type AspectScores = {
+  tesis: number;
+  sudut: number;
   relevansi: number;
-  emosi: number;
-  kebaruan: number;
-  timing: number;
-  shareability: number;
+  kutipan: number;
+  orisinalitas: number;
 };
 
-const KEYS = ["relevansi", "emosi", "kebaruan", "timing", "shareability"] as const;
+const KEYS = ["tesis", "sudut", "relevansi", "kutipan", "orisinalitas"] as const;
 
 export function totalScore(aspects: AspectScores): number {
   let sum = 0;
