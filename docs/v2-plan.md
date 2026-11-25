@@ -1,0 +1,47 @@
+# Redaksi v2: perspective channel
+
+v1 (`sisisabia58/ElvRedaksi`) is a news carousel newsroom. v2 turns it into a perspective media channel: curated essays and opinion pieces become summarized carousels with AI-generated covers. A human still approves every post.
+
+## Decisions (from the design discussion)
+
+| Topic | Decision |
+| --- | --- |
+| Images | AI generates the **cover only**. Text and the other slides stay HTML templates. Cover is generated after a human approves the copy. Daily render cap stays. |
+| Image label | AI covers carry an AI disclosure label. |
+| Photos rule | v1 "no news photos" becomes "no copied photos". AI covers are allowed. Never download or hotlink an author's or publisher's images. |
+| Ingestion | RSS first (Medium and Substack both publish feeds). Third-party crawler (Firecrawl or similar) is the fallback for sources with no feed. |
+| Content use | Summarize only, in our own words, with a credit and link back to the source. |
+| Niche | Customizable per brand. |
+| Language | Customizable. Source language and output language are separate settings. |
+| Sources | Operator curates. No automatic source discovery in v2. |
+| Cost | Not optimized yet. Tune during trials. |
+| Quality check | Judged by eye first. A/B testing later. |
+| Human gate | Unchanged: no publish without a human setting `scheduled`. |
+
+## Work items
+
+1. **Source model.** Add `kind` values `rss` and `crawl-listing` to sources. Crawl-listing stores a listing URL, fetches it through the crawler adapter, extracts article links, and dedupes by URL.
+2. **Crawler adapter.** One interface (`fetchListing`, `fetchArticle`) with a Firecrawl implementation and a local fake for tests and demo mode, mirroring how the LLM and Meta adapters work. Respect failures: a broken parse stores an error on the source row and creates no topic.
+3. **Perspective scoring.** Replace the news and viral rubric in the analyst prompt with: clear one-sentence thesis, contrarian or counterintuitive angle, relevance to the brand niche, quotable lines that fit slides, not generic information. The rubric lives in Brain notes so it is editable per niche.
+4. **Niche and language settings.** Brand settings gain niche, source language(s) and output language. Copywriter translates when they differ.
+5. **Summarize-only copywriter.** Prompt rules: summarize the idea in new words, never reproduce passages, always credit author and source.
+6. **AI cover.** New image provider adapter (demo fake plus one real provider). Hook into the render step for slide 1 only, after copy approval. Reuse `render-quota`. Overlay the headline with the existing template so text stays sharp. Fall back to the geometric cover on failure or when over quota.
+7. **AI disclosure.** Stamp or caption note on AI covers.
+8. **Copy and rename.** Update the Brain seed notes, marketing site, deck and `Sumber:` footer wording from newsroom to perspective channel. Remove news-only claims.
+9. **Tests.** Crawler fake, source dedupe, scoring prompt, cover fallback, quota.
+
+## Out of scope for v2
+
+- Automatic source discovery.
+- Cost optimization and A/B testing.
+- Reels, TikTok, and fully automatic posting.
+
+## First trial setup
+
+Run one niche. Use three sources that exercise each path: a Medium tag or publication feed, a Substack or newsletter feed, and one feed-less blog through the crawler. Include one Indonesian and one English source to test language handling.
+
+## Open items
+
+- Which crawler vendor, and its per-page cost.
+- Which image model for covers.
+- Exact AI label wording.
