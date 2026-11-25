@@ -29,12 +29,21 @@ import { fetchPublicText, PRIVATE_FETCH_MESSAGE } from "../rss/fetch-guard";
 import { excerptFromHtml } from "../rss/excerpt";
 import { parseFeed } from "../rss/parse";
 import { canonicalUrl } from "../crawl/canonical";
-import { articleLinksFromListing, crawlMaxArticlesPerScan, createCrawler, type Crawler } from "../crawl/crawler";
+import {
+  FakeCrawler,
+  articleLinksFromListing,
+  crawlMaxArticlesPerScan,
+  createCrawler,
+  titleFromMarkdown,
+  type CrawledArticle,
+  type Crawler,
+} from "../crawl/crawler";
 import { normalizeInsights, type DailyPoint } from "../studio/analytics";
 import { validateCoverPhotoDataUrl, withLockedDraftEdit } from "../studio/drafts";
 import { enqueue, type JobCtx } from "./runner";
 import { autoRendersUsed, maxAutoRendersPerDay, reserveAutoRender } from "./render-quota";
 import { maxAiCoversPerDay, reserveAiCover } from "./cover-quota";
+import { templateShowsCoverImage } from "../domain/brand";
 import { createImageProvider, type ImageProvider } from "../image/provider";
 
 export type ScoutCtx = JobCtx & {
@@ -89,16 +98,39 @@ async function insertTopicAndQueueScore(ctx: ScoutCtx, topic: NewTopic): Promise
   });
 }
 
+async function storeUnusableCrawlTopic(
+  ctx: ScoutCtx,
+  sourceId: string,
+  url: string,
+  reason: string,
+): Promise<void> {
+  // Remembered as a failed topic so a stub or broken page is not fetched (and paid for) on every scan.
+  await ctx.sql.rows(
+    `insert into topics (id, source_id, title, url, state, error)
+     values ($1, $2, $3, $4, 'failed', $5)
+     on conflict (url) do nothing`,
+    [randomUUID(), sourceId, titleFromMarkdown("", url), url, reason.slice(0, 300)],
+  );
+}
+
 async function scoutCrawlSource(
   ctx: ScoutCtx,
   source: { id: string; url: string },
 ): Promise<{ added: number; notes: string[] }> {
   const crawler = ctx.crawler ?? createCrawler();
+  const usingDefaultFake = !ctx.crawler && crawler instanceof FakeCrawler;
   const links = articleLinksFromListing(source.url, await crawler.listing(source.url), Number.MAX_SAFE_INTEGER);
+  const notes: string[] = [];
+  if (usingDefaultFake) {
+    notes.push("Crawler belum diatur (set CRAWLER_PROVIDER=tavily dan TAVILY_API_KEY)");
+  } else if (links.length === 0) {
+    notes.push("Tidak ada tautan artikel ditemukan di halaman daftar");
+  }
   const max = crawlMaxArticlesPerScan();
   let added = 0;
   let fetched = 0;
   let tooShort = 0;
+  let failed = 0;
   for (const link of links) {
     if (fetched >= max) {
       break;
@@ -108,9 +140,18 @@ async function scoutCrawlSource(
       continue;
     }
     fetched += 1;
-    const article = await crawler.article(link);
+    let article: CrawledArticle;
+    try {
+      article = await crawler.article(link);
+    } catch (error) {
+      failed += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      await storeUnusableCrawlTopic(ctx, source.id, link, `gagal diambil: ${message}`);
+      continue;
+    }
     if (article.text.trim().length < CRAWL_MIN_TEXT_CHARS) {
       tooShort += 1;
+      await storeUnusableCrawlTopic(ctx, source.id, link, "teks terlalu pendek");
       continue;
     }
     const inserted = await insertTopicAndQueueScore(ctx, {
@@ -127,10 +168,13 @@ async function scoutCrawlSource(
       added += 1;
     }
   }
-  return {
-    added,
-    notes: tooShort > 0 ? [`${tooShort} halaman dilewati: teks terlalu pendek (di bawah ${CRAWL_MIN_TEXT_CHARS} karakter)`] : [],
-  };
+  if (failed > 0) {
+    notes.push(`${failed} halaman gagal diambil`);
+  }
+  if (tooShort > 0) {
+    notes.push(`${tooShort} halaman dilewati: teks terlalu pendek (di bawah ${CRAWL_MIN_TEXT_CHARS} karakter)`);
+  }
+  return { added, notes };
 }
 
 async function hasQueuedScoutScan(sql: JobCtx["sql"]): Promise<boolean> {
@@ -162,9 +206,10 @@ export async function runScout(ctx: ScoutCtx): Promise<void> {
 
         for (const item of items) {
           const itemUrl = canonicalUrl(item.url);
+          // v1 stored the raw feed url, so match both forms to avoid re-ingesting after an upgrade.
           const known = await ctx.sql.rows<{ id: string }>(
-            `select id from topics where url = $1 limit 1`,
-            [itemUrl],
+            `select id from topics where url = $1 or url = $2 limit 1`,
+            [itemUrl, item.url],
           );
           if (known.length > 0) {
             continue;
@@ -1017,7 +1062,7 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
         const focalY = shot.focalY;
         let photoDataUrl = shot.photoDataUrl;
         let aiCover = false;
-        if (index === 0 && !photoDataUrl && draft.cover_image) {
+        if (index === 0 && !photoDataUrl && draft.cover_image && templateShowsCoverImage(template)) {
           photoDataUrl = safePhotoDataUrl(dataUrlFromBytes(draft.cover_image, draft.cover_type ?? ""));
           aiCover = photoDataUrl !== null;
         }
@@ -1118,12 +1163,13 @@ export async function runCoverJob(ctx: CoverCtx): Promise<void> {
   }
   const rows = await ctx.sql.rows<{
     status: string;
+    template: string;
     slides: Slide[] | string;
     cover_ai: boolean;
     niche: string;
     accent: string;
   }>(
-    `select d.status, d.slides, d.cover_ai, b.niche, b.accent
+    `select d.status, d.template, d.slides, d.cover_ai, b.niche, b.accent
      from drafts d cross join brand b
      where d.id = $1 and b.id = 1`,
     [draftId],
@@ -1140,7 +1186,11 @@ export async function runCoverJob(ctx: CoverCtx): Promise<void> {
     }
   };
 
-  if (draft.status === "posting" || draft.status === "posted" || draft.status === "simulasi") {
+  // Only an approved or scheduled draft needs a cover, and only a template that paints it.
+  if (
+    (draft.status !== "approved" && draft.status !== "scheduled") ||
+    !templateShowsCoverImage(draft.template)
+  ) {
     await finish(false);
     return;
   }
@@ -1181,7 +1231,8 @@ export async function runCoverJob(ctx: CoverCtx): Promise<void> {
     });
     await ctx.sql.tx(async (tx) => {
       await tx.rows(
-        `update drafts set cover_image = $1, cover_type = $2, cover_ai = true, cover_pending = false
+        `update drafts set cover_image = $1, cover_type = $2, cover_ai = true, cover_pending = false,
+                text_dirty = true, updated_at = clock_timestamp()
          where id = $3`,
         [Buffer.from(result.bytes), result.contentType, draftId],
       );
@@ -1372,7 +1423,7 @@ export async function runPublisher(ctx: JobCtx & { publisher?: Publisher; fetchI
     });
     const altTexts = assets.map((asset) => selected[asset.slide_index]?.headline ?? "");
     const hashtags = asStringArray(draft.hashtags);
-    const caption = `${draft.caption}\n\n${hashtags.map((tag) => `#${tag}`).join(" ")}${draft.cover_ai ? "\n\nCover: ilustrasi AI." : ""}`;
+    const caption = `${draft.caption}\n\n${hashtags.map((tag) => `#${tag}`).join(" ")}${draft.cover_ai && templateShowsCoverImage(draft.template) ? "\n\nCover: ilustrasi AI." : ""}`;
     result = await publisher.publish({
       igUserId: draft.ig_user_id ?? "",
       accessToken,

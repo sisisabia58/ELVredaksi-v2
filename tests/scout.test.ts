@@ -427,7 +427,8 @@ describe("scout crawl sources", () => {
       articles: { "https://blog.example/p/wall": article("https://blog.example/p/wall", { text: "x".repeat(100) }) },
     });
     await crawlScan(sql, crawler);
-    expect(await sql.rows("select id from topics")).toHaveLength(0);
+    expect(await sql.rows("select id from topics where state <> 'failed'")).toHaveLength(0);
+    expect(await sql.rows("select id from jobs where name = 'analyst.score'")).toHaveLength(0);
     const rows = await listSources(sql);
     expect(rows[0].lastError).toContain("terlalu pendek");
   });
@@ -454,5 +455,78 @@ describe("scout crawl sources", () => {
     await expect(
       addSource(sql, "admin", { name: "Bad", url: "https://x.example/", lang: "ID", kind: "pdf" as never }),
     ).rejects.toThrow();
+  });
+});
+
+describe("scout crawl robustness", () => {
+  async function crawlSource(sql: Awaited<ReturnType<typeof createTestSql>>) {
+    await addSource(sql, "admin", { name: "Blog", url: "https://blog.example/", lang: "EN", kind: "crawl" });
+  }
+
+  it("keeps going past a failing or too-short page and never refetches it", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await crawlSource(sql);
+    const urls = ["https://blog.example/p/bad", "https://blog.example/p/stub", "https://blog.example/p/good"];
+    const crawler = new FakeCrawler({
+      listings: { "https://blog.example/": urls },
+      articles: {
+        "https://blog.example/p/stub": article("https://blog.example/p/stub", { text: "pendek" }),
+        "https://blog.example/p/good": article("https://blog.example/p/good"),
+      },
+    });
+    await crawlScan(sql, crawler);
+    const topics = await sql.rows<{ url: string; state: string }>("select url, state from topics order by url");
+    expect(topics).toEqual([
+      { url: "https://blog.example/p/bad", state: "failed" },
+      { url: "https://blog.example/p/good", state: "new" },
+      { url: "https://blog.example/p/stub", state: "failed" },
+    ]);
+    const jobs = await sql.rows("select id from jobs where name = 'analyst.score'");
+    expect(jobs).toHaveLength(1);
+    const source = (await listSources(sql))[0];
+    expect(source.lastError).toContain("terlalu pendek");
+    expect(source.lastError).toContain("gagal");
+    const before = crawler.articleCalls.length;
+    await crawlScan(sql, crawler);
+    expect(crawler.articleCalls.length).toBe(before);
+  });
+
+  it("explains a crawl source that cannot produce anything", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await crawlSource(sql);
+    await crawlScan(sql, new FakeCrawler({ listings: { "https://blog.example/": [] } }));
+    expect((await listSources(sql))[0].lastError).toContain("Tidak ada tautan artikel");
+
+    const previous = process.env.CRAWLER_PROVIDER;
+    delete process.env.CRAWLER_PROVIDER;
+    try {
+      await runScout({
+        sql, payload: {}, manual: true, now: new Date("2026-10-28T02:00:00Z"),
+        fetchFeed: async () => xml, fetchPage: async () => "",
+      });
+    } finally {
+      if (previous !== undefined) process.env.CRAWLER_PROVIDER = previous;
+    }
+    expect((await listSources(sql))[0].lastError).toContain("Crawler belum diatur");
+  });
+
+  it("does not re-ingest a topic stored by v1 with its raw tracking url", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Feed", url: "https://news.example/feed", lang: "ID" });
+    const sources = await sql.rows<{ id: string }>("select id from sources");
+    await sql.rows("insert into topics (id, source_id, title, url) values ($1,$2,$3,$4)", [
+      "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1", sources[0].id, "Lama", "https://news.example/a/?utm_source=x",
+    ]);
+    const feed = `<?xml version="1.0"?><rss><channel><item><title>Lama</title>
+      <link>https://news.example/a/?utm_source=x</link><description>c</description></item></channel></rss>`;
+    await runScout({
+      sql, payload: {}, manual: true, now: new Date("2026-10-28T01:00:00Z"),
+      fetchFeed: async () => feed, fetchPage: async () => "<p>x</p>",
+    });
+    expect(await sql.rows("select id from topics")).toHaveLength(1);
+    expect(await sql.rows("select id from jobs where name = 'analyst.score'")).toHaveLength(0);
   });
 });

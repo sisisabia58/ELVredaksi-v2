@@ -16,3 +16,10 @@ export function clampSlideCount(value: unknown): 2 | 3 {
 export function safeAccent(accent: string): string {
   return /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : DEFAULT_ACCENT;
 }
+
+/** Templates whose slide 1 actually paints a cover image. Stabilo and Catatan ignore it. */
+export const PHOTO_TEMPLATES: readonly SlideTemplateName[] = ["serif", "foto_penuh", "berita_pro"];
+
+export function templateShowsCoverImage(template: string): boolean {
+  return (PHOTO_TEMPLATES as readonly string[]).includes(template);
+}

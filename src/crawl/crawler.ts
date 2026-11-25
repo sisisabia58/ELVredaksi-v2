@@ -14,7 +14,8 @@ export interface Crawler {
   article(url: string): Promise<CrawledArticle>;
 }
 
-const NON_ARTICLE_PATH = /^\/(tag|tags|author|authors|category|categories|page)(\/|$)/i;
+const NON_ARTICLE_PATH =
+  /^\/(tag|tags|author|authors|category|categories|page|penulis|kategori|topik|indeks|about|tentang|contact|kontak|login|masuk|subscribe|search|cari|privacy)(\/|$)/i;
 
 export function articleLinksFromListing(listingUrl: string, links: string[], max: number): string[] {
   let listing: URL;
@@ -24,6 +25,7 @@ export function articleLinksFromListing(listingUrl: string, links: string[], max
     return [];
   }
   const listingCanonical = canonicalUrl(listing.href);
+  const listingPath = listing.pathname.replace(/\/+$/, "") || "/";
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of links) {
@@ -36,6 +38,9 @@ export function articleLinksFromListing(listingUrl: string, links: string[], max
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
     if (parsed.host.toLowerCase() !== listing.host.toLowerCase()) continue;
     if (NON_ARTICLE_PATH.test(parsed.pathname)) continue;
+    const path = parsed.pathname.replace(/\/+$/, "") || "/";
+    // The site root, the listing itself (even with a query), and any ancestor of it are navigation.
+    if (path === "/" || path === listingPath || listingPath.startsWith(`${path}/`)) continue;
     const canonical = canonicalUrl(parsed.href);
     if (canonical === listingCanonical || seen.has(canonical)) continue;
     seen.add(canonical);

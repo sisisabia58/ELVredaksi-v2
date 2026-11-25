@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTestSql } from "../src/db/client";
 import { seedDefaults } from "../src/db/seed";
 import { SLIDE_TEMPLATES } from "../src/domain/brand";
@@ -14,11 +14,27 @@ const TOPIC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1";
 const SOURCE = "11111111-1111-1111-1111-111111111111";
 const NOW = new Date("2026-10-28T02:00:00Z");
 
-const envSnapshot = process.env.MAX_AI_COVERS_PER_DAY;
-afterEach(() => {
-  if (envSnapshot === undefined) delete process.env.MAX_AI_COVERS_PER_DAY;
-  else process.env.MAX_AI_COVERS_PER_DAY = envSnapshot;
+const ENV_KEYS = ["MAX_AI_COVERS_PER_DAY", "IMAGE_PROVIDER"] as const;
+const envSnapshot = new Map<string, string | undefined>(ENV_KEYS.map((key) => [key, process.env[key]]));
+beforeEach(() => {
+  // A real provider is configured, so approving queues an AI cover.
+  process.env.IMAGE_PROVIDER = "cloudflare";
 });
+afterEach(() => {
+  for (const [key, value] of envSnapshot) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+const fakeRaster = {
+  async toPng() {
+    return new Uint8Array([1]);
+  },
+};
+async function renderOnce(sql: Awaited<ReturnType<typeof createTestSql>>) {
+  await runDesigner({ sql, payload: { draftId: DRAFT }, manual: true, now: NOW, rasterizer: fakeRaster });
+}
 
 const baseSlides = [
   { role: "cover", kicker: "Opini", headline: "Kenapa tim kecil menang", body: "Pembuka." },
@@ -136,7 +152,54 @@ describe("cover pending gate", () => {
     await expect(scheduleDraft(sql, "admin", DRAFT, later)).rejects.toThrow(/Cover AI sedang dibuat/);
     await expect(postDraftNow(sql, "admin", DRAFT)).rejects.toThrow(/Cover AI sedang dibuat/);
     await runCoverJob({ sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: new DemoImageProvider() });
+    await renderOnce(sql);
     await expect(scheduleDraft(sql, "admin", DRAFT, later)).resolves.toBeUndefined();
+  });
+
+  it("keeps scheduling blocked after the cover is stored until the new render has run", async () => {
+    const sql = await seed("needs_review");
+    await approveDraft(sql, "admin", DRAFT);
+    await runCoverJob({ sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: new DemoImageProvider() });
+    const later = new Date(Date.now() + 3600_000);
+    const row = await sql.rows<{ cover_pending: boolean; text_dirty: boolean }>("select cover_pending, text_dirty from drafts");
+    expect(row[0]).toEqual({ cover_pending: false, text_dirty: true });
+    await expect(scheduleDraft(sql, "admin", DRAFT, later)).rejects.toThrow(/Render dulu/);
+    await expect(postDraftNow(sql, "admin", DRAFT)).rejects.toThrow(/Render dulu/);
+    await renderOnce(sql);
+    await expect(scheduleDraft(sql, "admin", DRAFT, later)).resolves.toBeUndefined();
+  });
+});
+
+describe("when an AI cover is worth making", () => {
+  it("queues nothing for templates that never show a photo", async () => {
+    const sql = await seed();
+    await sql.rows("update drafts set template = 'stabilo' where id = $1", [DRAFT]);
+    await approveDraft(sql, "admin", DRAFT);
+    expect(await jobs(sql, "designer.cover")).toHaveLength(0);
+    expect((await sql.rows<{ cover_pending: boolean }>("select cover_pending from drafts"))[0].cover_pending).toBe(false);
+  });
+
+  it("queues nothing with the demo provider, with no provider set, or with the cap at 0", async () => {
+    for (const setup of [
+      () => { process.env.IMAGE_PROVIDER = "demo"; },
+      () => { delete process.env.IMAGE_PROVIDER; },
+      () => { process.env.IMAGE_PROVIDER = "cloudflare"; process.env.MAX_AI_COVERS_PER_DAY = "0"; },
+    ]) {
+      setup();
+      const sql = await seed();
+      await approveDraft(sql, "admin", DRAFT);
+      expect(await jobs(sql, "designer.cover")).toHaveLength(0);
+      expect((await sql.rows<{ cover_pending: boolean }>("select cover_pending from drafts"))[0].cover_pending).toBe(false);
+    }
+  });
+
+  it("does not generate for a draft that is no longer approved or scheduled", async () => {
+    const sql = await seed("needs_review");
+    await sql.rows("update drafts set cover_pending = true where id = $1", [DRAFT]);
+    const provider = new CountingProvider();
+    await runCoverJob({ sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: provider });
+    expect(provider.calls).toBe(0);
+    expect((await sql.rows<{ cover_pending: boolean }>("select cover_pending from drafts"))[0].cover_pending).toBe(false);
   });
 });
 
@@ -231,5 +294,24 @@ describe("designer uses the stored AI cover", () => {
     const pages = await render(sql);
     expect(pages[0]).toContain(png);
     expect(pages[0]).not.toContain("Ilustrasi AI");
+  });
+});
+
+describe("AI label only where the cover is visible", () => {
+  it("adds no badge and no caption line on a template without a photo slot", async () => {
+    const sql = await seed("drafted");
+    await sql.rows("update drafts set template = 'stabilo', cover_image = $1, cover_type = 'image/png', cover_ai = true where id = $2", [
+      Buffer.from("x"), DRAFT,
+    ]);
+    const pages: string[] = [];
+    await runDesigner({
+      sql, payload: { draftId: DRAFT }, manual: true, now: NOW,
+      rasterizer: { async toPng(html: string) { pages.push(html); return new Uint8Array([1]); } },
+    });
+    expect(pages[0]).not.toContain("Ilustrasi AI");
+    await sql.rows("update drafts set status = 'posting' where id = $1", [DRAFT]);
+    const publisher = new FakePublisher();
+    await runPublisher({ sql, payload: { draftId: DRAFT }, manual: true, now: NOW, publisher });
+    expect(publisher.calls[0]?.caption).not.toContain("Cover: ilustrasi AI.");
   });
 });

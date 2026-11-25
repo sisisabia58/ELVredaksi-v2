@@ -70,7 +70,7 @@ Every topic stores the article URL, the source name and, when known, the author.
 
 ## Crawler and image providers
 
-`CRAWLER_PROVIDER=fake` (default) never touches the network. `CRAWLER_PROVIDER=tavily` needs `TAVILY_API_KEY`; a source of kind `crawl` is a listing page, and each scan fetches at most `CRAWL_MAX_ARTICLES_PER_SCAN` (default 5) new articles. `IMAGE_PROVIDER=demo` (default) draws a flat local cover. `IMAGE_PROVIDER=cloudflare` needs `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`; set `CLOUDFLARE_IMAGE_USD_PER_IMAGE` so spend is recorded. If an AI cover fails or the daily cap is reached, the draft keeps its geometric cover.
+`CRAWLER_PROVIDER=fake` (default) never touches the network. `CRAWLER_PROVIDER=tavily` needs `TAVILY_API_KEY`; a source of kind `crawl` is a listing page, and each scan fetches at most `CRAWL_MAX_ARTICLES_PER_SCAN` (default 5) new articles. `IMAGE_PROVIDER=demo` (default) means approving a draft never queues an AI cover, so nothing is labelled `Ilustrasi AI`. AI covers are only made for the `serif`, `foto_penuh` and `berita_pro` templates. `IMAGE_PROVIDER=cloudflare` needs `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`; set `CLOUDFLARE_IMAGE_USD_PER_IMAGE` so spend is recorded. If an AI cover fails or the daily cap is reached, the draft keeps its geometric cover.
 
 ## Docker
 

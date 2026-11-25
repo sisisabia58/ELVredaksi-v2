@@ -5,6 +5,8 @@ import { draftAwaitsRewrite } from "../domain/placeholder";
 import { assertTransition, type DraftStatus } from "../domain/status";
 import { slidesForFormat, type SlideTemplate } from "../render/html";
 import { enqueue } from "../jobs/runner";
+import { aiCoversEnabled } from "../jobs/cover-quota";
+import { templateShowsCoverImage } from "../domain/brand";
 import { livePublishBlock } from "../publish/mode";
 
 const COVER_PHOTO_DATA_URL =
@@ -538,7 +540,7 @@ export async function approveDraftInTx(tx: Sql, role: Role, id: string): Promise
 
 /** After a human approves, ask for one AI cover unless the draft already has one or the operator uploaded a photo. */
 async function queueAiCover(tx: Sql, id: string, row: DraftRow): Promise<void> {
-  if (row.cover_ai) {
+  if (row.cover_ai || !aiCoversEnabled() || !templateShowsCoverImage(row.template)) {
     return;
   }
   const slides = parseSlides(row.slides);

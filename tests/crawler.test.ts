@@ -40,6 +40,28 @@ describe("articleLinksFromListing", () => {
   });
 });
 
+describe("articleLinksFromListing on a section page", () => {
+  it("drops the site root, the listing itself, its query variants, ancestors and utility pages", () => {
+    const links = [
+      "https://blog.example/",
+      "https://blog.example/opini",
+      "https://blog.example/opini?page=2",
+      "https://blog.example/about",
+      "https://blog.example/login",
+      "https://blog.example/subscribe",
+      "https://blog.example/search",
+      "https://blog.example/penulis/dina",
+      "https://blog.example/kategori/ekonomi",
+      "https://blog.example/topik/ai",
+      "https://blog.example/tentang",
+      "https://blog.example/opini/esai-satu",
+    ];
+    expect(articleLinksFromListing("https://blog.example/opini", links, 10)).toEqual([
+      "https://blog.example/opini/esai-satu",
+    ]);
+  });
+});
+
 describe("titleFromMarkdown", () => {
   it("uses the first heading, else the url slug", () => {
     expect(titleFromMarkdown("intro\n# Real Title\nbody", "https://b.example/p/x")).toBe("Real Title");

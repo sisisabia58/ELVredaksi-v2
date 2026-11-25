@@ -30,3 +30,9 @@ export async function reserveAiCover(sql: Sql, now: Date, cap: number): Promise<
   );
   return rows.length > 0;
 }
+
+/** AI covers are made only with a real image provider configured and a cap above 0. */
+export function aiCoversEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const provider = env.IMAGE_PROVIDER?.trim() || "demo";
+  return provider !== "demo" && maxAiCoversPerDay(env) > 0;
+}
