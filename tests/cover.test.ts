@@ -315,3 +315,15 @@ describe("AI label only where the cover is visible", () => {
     expect(publisher.calls[0]?.caption).not.toContain("Cover: ilustrasi AI.");
   });
 });
+
+describe("AI badge placement", () => {
+  it("sits clear of the vertical source credit on the right edge", () => {
+    const html = renderSlideHtml({
+      template: "berita_pro",
+      slide: { role: "cover", kicker: "Opini", headline: "Judul cukup panjang", body: "Isi." },
+      index: 0, total: 2, handle: "h", sourceName: "Contoh", accent: "#4E708C",
+      focalY: 50, photoDataUrl: null, aiCover: true,
+    });
+    expect(html).toMatch(/position:fixed;right:72px;bottom:28px/);
+  });
+});

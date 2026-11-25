@@ -107,6 +107,13 @@ describe("berita pro", () => {
     expect(withPhoto).toContain("brightness(1.45)");
     expect(withPhoto).toContain("height:810px");
 
+    const ai = renderBeritaProHtml(slideInput(0, { photoDataUrl: photo, aiCover: true }));
+    expect(ai).toContain("Sumber: ANTARA");
+    expect(ai).not.toContain("Foto: ANTARA");
+    expect(ai).not.toContain("grayscale(1)");
+    expect(ai).not.toContain("mix-blend-mode:multiply");
+    expect(ai).toContain("object-fit:cover");
+
     const sourced = renderBeritaProHtml(
       slideInput(1, {
         slide: {

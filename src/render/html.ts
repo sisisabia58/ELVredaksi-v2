@@ -168,7 +168,7 @@ function renderCatatan(input: RenderSlideInput): string {
 }
 
 const AI_BADGE =
-  '<div style="position:fixed;right:28px;bottom:28px;z-index:99;padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.62);color:#fff;font:600 22px/1 Inter,sans-serif;letter-spacing:0.02em;">Ilustrasi AI</div>';
+  '<div style="position:fixed;right:72px;bottom:28px;z-index:99;padding:8px 16px;border-radius:999px;background:rgba(0,0,0,0.62);color:#fff;font:600 22px/1 Inter,sans-serif;letter-spacing:0.02em;">Ilustrasi AI</div>';
 
 /** Slide 1 of a draft whose cover was drawn by AI carries a visible label. */
 export function renderSlideHtml(input: RenderSlideInput): string {

@@ -25,6 +25,8 @@ export type BeritaProInput = {
   photoDataUrl: string | null;
   logoDataUrl?: string | null;
   initial?: string;
+  /** The photo is an AI illustration: keep its colors and credit the source with "Sumber:". */
+  aiCover?: boolean;
 };
 
 export function coverHeadlinePx(headline: string): number {
@@ -134,13 +136,16 @@ function decorations(accent: string): string {
     <div style="position:absolute;left:36px;bottom:40px;width:180px;height:130px;background-image:radial-gradient(${accent} 1.7px, transparent 1.8px);background-size:11px 11px;"></div>`;
 }
 
-function photoCredit(sourceName: string): string {
-  return `<div style="position:absolute;right:16px;top:28px;bottom:28px;z-index:4;writing-mode:vertical-rl;transform:rotate(180deg);color:#FFFFFF;font-family:Inter,sans-serif;font-size:18px;font-weight:500;letter-spacing:0.14em;text-shadow:0 1px 2px rgba(0,0,0,0.55);">Foto: ${escapeHtml(sourceName)}</div>`;
+function photoCredit(sourceName: string, label: "Foto" | "Sumber" = "Foto"): string {
+  return `<div style="position:absolute;right:16px;top:28px;bottom:28px;z-index:4;writing-mode:vertical-rl;transform:rotate(180deg);color:#FFFFFF;font-family:Inter,sans-serif;font-size:18px;font-weight:500;letter-spacing:0.14em;text-shadow:0 1px 2px rgba(0,0,0,0.55);">${label}: ${escapeHtml(sourceName)}</div>`;
 }
 
 function photoPanel(input: BeritaProInput, accent: string): string {
   const photo = safePhotoDataUrl(input.photoDataUrl);
-  const art = photo
+  const art = photo && input.aiCover
+    ? `<img src="${escapeHtml(photo)}" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center ${input.focalY}%;" />
+       ${photoCredit(input.sourceName, "Sumber")}`
+    : photo
     ? `<img src="${escapeHtml(photo)}" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center ${input.focalY}%;filter:grayscale(1) contrast(1.65) brightness(1.45);" />
        <div style="position:absolute;inset:0;background:#2a3c56;mix-blend-mode:multiply;opacity:0.62;"></div>
        <div style="position:absolute;inset:0;background:#e4ebf2;mix-blend-mode:screen;opacity:0.42;"></div>

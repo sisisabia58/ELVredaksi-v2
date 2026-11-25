@@ -24,16 +24,17 @@ afterEach(() => {
 });
 
 describe("coverPrompt", () => {
-  it("names the headline and niche and forbids text, logos and real people", () => {
+  it("never contains the headline (the model draws any words it is given) but names the niche", () => {
     const prompt = coverPrompt(req);
-    expect(prompt).toContain("Kenapa tim kecil menang");
+    expect(prompt).not.toContain("Kenapa tim kecil menang");
+    expect(prompt).not.toContain("Opini");
     expect(prompt).toContain("keuangan pribadi");
-    for (const phrase of ["no text", "no logos", "no real people"]) {
+    for (const phrase of ["no text", "no letters", "no logos", "no real people"]) {
       expect(prompt).toContain(phrase);
     }
   });
-  it("stays under 2000 characters even for a very long headline", () => {
-    expect(coverPrompt({ ...req, headline: "x".repeat(500) }).length).toBeLessThanOrEqual(2000);
+  it("stays under 2000 characters even for a very long niche", () => {
+    expect(coverPrompt({ ...req, niche: "x".repeat(500) }).length).toBeLessThanOrEqual(2000);
   });
 });
 
@@ -80,7 +81,7 @@ describe("CloudflareImageProvider", () => {
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tok-secret");
     const body = JSON.parse(init.body as string);
     expect(body.steps).toBe(4);
-    expect(body.prompt).toContain("Kenapa tim kecil menang");
+    expect(body.prompt).toContain("keuangan pribadi");
   });
 
   it("fails cleanly and never leaks the token", async () => {
