@@ -26,7 +26,7 @@ import { dataUrlFromBytes } from "../rss/image-cache";
 import { PlaywrightRasterizer, type Rasterizer } from "../render/raster";
 import { createLlm, type LlmProvider } from "../llm/provider";
 import { fetchPublicText, PRIVATE_FETCH_MESSAGE } from "../rss/fetch-guard";
-import { excerptFromHtml } from "../rss/excerpt";
+import { excerptFromHtml, titleFromHtml } from "../rss/excerpt";
 import { parseFeed } from "../rss/parse";
 import { canonicalUrl } from "../crawl/canonical";
 import {
@@ -154,9 +154,18 @@ async function scoutCrawlSource(
       await storeUnusableCrawlTopic(ctx, source.id, link, "teks terlalu pendek");
       continue;
     }
+    let title = article.title;
+    if (article.titleGuessed) {
+      // The text had no heading: ask the page itself (free, no crawler credits). Best effort.
+      try {
+        title = titleFromHtml(await ctx.fetchPage(link)) ?? title;
+      } catch {
+        // keep the guessed title
+      }
+    }
     const inserted = await insertTopicAndQueueScore(ctx, {
       sourceId: source.id,
-      title: article.title,
+      title,
       url: link,
       summary: "",
       excerpt: article.text.slice(0, CRAWL_EXCERPT_MAX_CHARS),

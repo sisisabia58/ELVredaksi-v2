@@ -7,6 +7,8 @@ export type CrawledArticle = {
   author: string | null;
   text: string;
   publishedAt: Date | null;
+  /** True when the title was guessed from the url because the text had no heading. */
+  titleGuessed?: boolean;
 };
 
 export interface Crawler {
@@ -50,12 +52,16 @@ export function articleLinksFromListing(listingUrl: string, links: string[], max
   return out;
 }
 
+export function headingFromMarkdown(markdown: string): string | null {
+  return markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() || null;
+}
+
 export function titleFromMarkdown(markdown: string, fallbackUrl: string): string {
-  const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  const heading = headingFromMarkdown(markdown);
   if (heading) return heading;
   try {
     const slug = new URL(fallbackUrl).pathname.split("/").filter(Boolean).pop() ?? "";
-    return decodeURIComponent(slug).replace(/-/g, " ").trim() || fallbackUrl;
+    return decodeURIComponent(slug).replace(/\.[a-z0-9]{2,5}$/i, "").replace(/-/g, " ").trim() || fallbackUrl;
   } catch {
     return fallbackUrl;
   }
@@ -125,7 +131,14 @@ export class TavilyCrawler implements Crawler {
     if (!first || !raw) {
       throw new Error(`Tavily tidak mengembalikan isi untuk ${url}`);
     }
-    return { url, title: titleFromMarkdown(raw, url), author: null, text: raw, publishedAt: null };
+    return {
+      url,
+      title: titleFromMarkdown(raw, url),
+      author: null,
+      text: raw,
+      publishedAt: null,
+      titleGuessed: headingFromMarkdown(raw) === null,
+    };
   }
 }
 

@@ -66,6 +66,7 @@ describe("titleFromMarkdown", () => {
   it("uses the first heading, else the url slug", () => {
     expect(titleFromMarkdown("intro\n# Real Title\nbody", "https://b.example/p/x")).toBe("Real Title");
     expect(titleFromMarkdown("no heading", "https://b.example/p/my-first-post")).toBe("my first post");
+    expect(titleFromMarkdown("", "https://www.paulgraham.com/schlep.html")).toBe("schlep");
   });
 });
 
@@ -114,6 +115,17 @@ describe("TavilyCrawler", () => {
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://api.tavily.com/extract");
     expect(JSON.parse(init.body as string)).toMatchObject({ urls: ["https://b.example/p/1"], format: "markdown" });
+  });
+
+  it("flags a title it had to guess from the url", async () => {
+    const make = (raw: string) =>
+      new TavilyCrawler(
+        "k",
+        (async () => jsonResponse({ results: [{ url: "https://b.example/p/x", raw_content: raw }] })) as unknown as typeof fetch,
+        async () => {},
+      );
+    expect((await make("# Judul\n\nisi").article("https://b.example/p/x")).titleGuessed).toBe(false);
+    expect((await make("| a | b |\n\nisi").article("https://b.example/p/x")).titleGuessed).toBe(true);
   });
 
   it("throws without leaking the key", async () => {

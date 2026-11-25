@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseFeed } from "../src/rss/parse";
-import { excerptFromHtml, imageUrlFromHtml } from "../src/rss/excerpt";
+import { excerptFromHtml, imageUrlFromHtml, titleFromHtml } from "../src/rss/excerpt";
 import { createTestSql } from "../src/db/client";
 import { seedDefaults } from "../src/db/seed";
 import { addSource, deleteSource, listSources } from "../src/studio/sources";
@@ -528,5 +528,40 @@ describe("scout crawl robustness", () => {
     });
     expect(await sql.rows("select id from topics")).toHaveLength(1);
     expect(await sql.rows("select id from jobs where name = 'analyst.score'")).toHaveLength(0);
+  });
+});
+
+describe("titleFromHtml", () => {
+  it("prefers og:title, falls back to <title>, decodes entities and drops a ' | Site' suffix", () => {
+    expect(titleFromHtml(`<meta property="og:title" content="Schlep &amp; Co"><title>Other</title>`)).toBe("Schlep & Co");
+    expect(titleFromHtml(`<title>Schlep Blindness | Paul Graham</title>`)).toBe("Schlep Blindness");
+    expect(titleFromHtml(`<title>  Dua – Judul  </title>`)).toBe("Dua – Judul");
+    expect(titleFromHtml(`<p>tanpa judul</p>`)).toBeNull();
+  });
+});
+
+describe("scout crawl titles", () => {
+  async function run(fetchPage: (url: string) => Promise<string>) {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Blog", url: "https://blog.example/", lang: "EN", kind: "crawl" });
+    const crawler = new FakeCrawler({
+      listings: { "https://blog.example/": ["https://blog.example/p/schlep.html"] },
+      articles: {
+        "https://blog.example/p/schlep.html": article("https://blog.example/p/schlep.html", { title: "schlep", titleGuessed: true }),
+      },
+    });
+    await runScout({
+      sql, payload: {}, manual: true, now: new Date("2026-10-28T01:00:00Z"),
+      fetchFeed: async () => xml, fetchPage, crawler,
+    });
+    return (await sql.rows<{ title: string }>("select title from topics"))[0]?.title;
+  }
+
+  it("replaces a guessed title with the page title", async () => {
+    expect(await run(async () => `<title>Schlep Blindness | Paul Graham</title>`)).toBe("Schlep Blindness");
+  });
+  it("keeps the guess when the page cannot be fetched", async () => {
+    expect(await run(async () => { throw new Error("halaman gagal"); })).toBe("schlep");
   });
 });
