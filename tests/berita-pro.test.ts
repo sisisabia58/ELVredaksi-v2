@@ -1,5 +1,6 @@
 import sharp from "sharp";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as imageCache from "../src/rss/image-cache";
 import { parseCopy } from "../src/agents/copywriter";
 import { boot, migrateStoredBrand } from "../src/db/boot";
 import { createTestSql } from "../src/db/client";
@@ -363,6 +364,53 @@ describe("berita pro", () => {
     expect(assets).toHaveLength(3);
     const status = await sql.rows<{ status: string }>("select status from drafts");
     expect(status[0]?.status).toBe("needs_review");
+  });
+});
+
+describe("designer never uses a source photo", () => {
+  it("does not fetch or cache the topic image for the cover", async () => {
+    const spy = vi.spyOn(imageCache, "cachedImageDataUrl");
+    const sql = await createTestSql();
+    const { seedDefaults } = await import("../src/db/seed");
+    const { FakeRasterizer } = await import("../src/render/raster");
+    await seedDefaults(sql);
+    await sql.rows("insert into sources (id, name, url, lang) values ($1,$2,$3,$4)", [
+      "11111111-1111-1111-1111-111111111111",
+      "Blog",
+      "https://blog.example/",
+      "ID",
+    ]);
+    await sql.rows(
+      "insert into topics (id, source_id, title, url, state, image_url) values ($1,$2,$3,$4,'drafted',$5)",
+      [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1",
+        "11111111-1111-1111-1111-111111111111",
+        "Esai",
+        "https://blog.example/esai",
+        "https://cdn.example/photo.jpg",
+      ],
+    );
+    await sql.rows(
+      `insert into drafts (id, topic_id, status, format, template, slides, caption, hashtags, alt_headlines, short_code)
+       values ($1,$2,'drafted','teaser_bio','berita_pro',$3::jsonb,'cap',$4::jsonb,$5::jsonb,'img02')`,
+      [
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb1",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1",
+        JSON.stringify(slides),
+        JSON.stringify(["beras", "pasar", "stok"]),
+        JSON.stringify(["Alt satu cukup", "Alt dua cukup"]),
+      ],
+    );
+    await runDesigner({
+      sql,
+      payload: { draftId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb1" },
+      manual: true,
+      now: new Date(),
+      rasterizer: new FakeRasterizer(),
+    });
+    expect(spy).not.toHaveBeenCalled();
+    expect(await sql.rows("select url_hash from image_cache")).toHaveLength(0);
+    spy.mockRestore();
   });
 });
 

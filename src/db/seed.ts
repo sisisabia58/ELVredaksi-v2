@@ -36,7 +36,7 @@ const BRAIN_DOCS: { slug: string; title: string; body: string }[] = [
   {
     slug: "06-aturan-carousel",
     title: "Aturan carousel",
-    body: "Carousel penuh: 1 sampul + 2 sampai 5 slide poin. Teaser: sampul + 1 slide CTA ke link bio. Template Berita Pro menayangkan paling banyak 3 gambar: sampul plus 1 atau 2 slide isi. Ajakan baca link bio ada di slide isi terakhir, bukan slide terpisah. Setiap slide memuat nama sumber. Foto diambil dari gambar artikel, bukan dari permintaan ke model.",
+    body: "Carousel penuh: 1 sampul + 2 sampai 5 slide poin. Teaser: sampul + 1 slide CTA ke link bio. Template Berita Pro menayangkan paling banyak 3 gambar: sampul plus 1 atau 2 slide isi. Ajakan baca link bio ada di slide isi terakhir, bukan slide terpisah. Setiap slide memuat nama sumber. Cover dibuat AI atau diunggah operator. Jangan memakai foto dari artikel.",
   },
 ];
 

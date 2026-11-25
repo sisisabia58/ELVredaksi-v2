@@ -21,11 +21,11 @@ import { FakePublisher, MetaPublisher, type Publisher, type PublishResult } from
 import { clampSlideCount } from "../domain/brand";
 import { renderSlideHtml, safePhotoDataUrl, slidesForFormat, type SlideTemplate } from "../render/html";
 import { defaultLogoDataUrl } from "../render/brand-logo";
-import { dataUrlFromBytes, cachedImageDataUrl } from "../rss/image-cache";
+import { dataUrlFromBytes } from "../rss/image-cache";
 import { PlaywrightRasterizer, type Rasterizer } from "../render/raster";
 import { createLlm, type LlmProvider } from "../llm/provider";
 import { fetchPublicText, PRIVATE_FETCH_MESSAGE } from "../rss/fetch-guard";
-import { excerptFromHtml, imageUrlFromHtml } from "../rss/excerpt";
+import { excerptFromHtml } from "../rss/excerpt";
 import { parseFeed } from "../rss/parse";
 import { canonicalUrl } from "../crawl/canonical";
 import { articleLinksFromListing, crawlMaxArticlesPerScan, createCrawler, type Crawler } from "../crawl/crawler";
@@ -164,32 +164,13 @@ export async function runScout(ctx: ScoutCtx): Promise<void> {
             [itemUrl],
           );
           if (known.length > 0) {
-            if (item.imageUrl && known[0]) {
-              const filled = await ctx.sql.rows<{ id: string }>(
-                `update topics set image_url = $1
-                 where id = $2 and coalesce(image_url, '') = ''
-                 returning id`,
-                [item.imageUrl, known[0].id],
-              );
-              if (filled[0]) {
-                await ctx.sql.rows(
-                  `update drafts set text_dirty = true, updated_at = $1
-                   where topic_id = $2 and status in ('needs_review', 'drafted')`,
-                  [ctx.now, known[0].id],
-                );
-              }
-            }
             continue;
           }
 
           let excerpt = "";
-          let imageUrl = item.imageUrl;
           try {
             const html = await ctx.fetchPage(item.url);
             excerpt = excerptFromHtml(html);
-            if (!imageUrl) {
-              imageUrl = imageUrlFromHtml(html, item.url);
-            }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             if (message === PRIVATE_FETCH_MESSAGE) {
@@ -206,7 +187,7 @@ export async function runScout(ctx: ScoutCtx): Promise<void> {
               summary: item.summary,
               excerpt,
               publishedAt: item.publishedAt,
-              imageUrl,
+              imageUrl: null,
               author: null,
             })
           ) {
@@ -941,13 +922,12 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
     accent: string;
     initial: string;
     slide_count: number;
-    image_url: string | null;
     logo: unknown;
     logo_type: string | null;
     updated_at: Date;
   }>(
     `select d.status, d.format, d.template, d.slides, d.focal_y, d.updated_at,
-            s.name as source_name, t.image_url, b.handle, b.accent, b.initial,
+            s.name as source_name, b.handle, b.accent, b.initial,
             b.slide_count, b.logo, b.logo_type
      from drafts d
      join topics t on t.id = d.topic_id
@@ -1008,10 +988,7 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
         const slide = selected[index];
         const shot = photoInputForSlide(slide, draft.focal_y);
         const focalY = shot.focalY;
-        let photoDataUrl = shot.photoDataUrl;
-        if (template === "berita_pro" && slide.role === "cover" && !photoDataUrl && draft.image_url) {
-          photoDataUrl = safePhotoDataUrl(await cachedImageDataUrl(ctx.sql, draft.image_url));
-        }
+        const photoDataUrl = shot.photoDataUrl;
         const html = renderSlideHtml({
           template,
           slide,

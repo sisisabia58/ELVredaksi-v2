@@ -220,7 +220,7 @@ describe("scout", () => {
     expect(pageFetches).toBe(1);
   });
 
-  it("fills a missing image on a known topic from the feed and does not refetch the article", async () => {
+  it("never stores a feed image on a known topic, leaves its draft alone and does not refetch the article", async () => {
     const sql = await createTestSql();
     const sourceId = "11111111-1111-1111-1111-111111111111";
     const topicId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1";
@@ -260,9 +260,9 @@ describe("scout", () => {
     });
     expect(pageFetches).toBe(0);
     const topics = await sql.rows<{ image_url: string }>("select image_url from topics where id = $1", [topicId]);
-    expect(topics[0]?.image_url).toBe("https://cdn.example/kkp.jpg");
+    expect(topics[0]?.image_url).toBeNull();
     const drafts = await sql.rows<{ text_dirty: boolean }>("select text_dirty from drafts where id = $1", [draftId]);
-    expect(drafts[0]?.text_dirty).toBe(true);
+    expect(drafts[0]?.text_dirty).toBe(false);
     await runScout({
       sql,
       payload: {},
@@ -276,7 +276,7 @@ describe("scout", () => {
       },
     });
     const again = await sql.rows<{ image_url: string }>("select image_url from topics where id = $1", [topicId]);
-    expect(again[0]?.image_url).toBe("https://cdn.example/kkp.jpg");
+    expect(again[0]?.image_url).toBeNull();
     expect(pageFetches).toBe(0);
   });
 
@@ -356,6 +356,27 @@ async function crawlScan(sql: Awaited<ReturnType<typeof createTestSql>>, crawler
     crawler,
   });
 }
+
+describe("scout never keeps a feed photo", () => {
+  it("stores a new topic with no image_url even when the feed and page carry one", async () => {
+    const sql = await createTestSql();
+    await seedDefaults(sql);
+    await addSource(sql, "admin", { name: "Foto", url: "https://news.example/feed", lang: "ID" });
+    const feed = `<?xml version="1.0"?><rss><channel><item><title>Foto</title>
+      <link>https://news.example/foto</link>
+      <enclosure url="https://cdn.example/a.jpg" type="image/jpeg"/><description>c</description></item></channel></rss>`;
+    await runScout({
+      sql,
+      payload: {},
+      manual: true,
+      now: new Date("2026-10-28T01:00:00Z"),
+      fetchFeed: async () => feed,
+      fetchPage: async () => `<meta property="og:image" content="https://cdn.example/og.jpg"><p>Isi.</p>`,
+    });
+    const rows = await sql.rows<{ image_url: string | null }>("select image_url from topics");
+    expect(rows).toEqual([{ image_url: null }]);
+  });
+});
 
 describe("scout crawl sources", () => {
   it("stores crawled articles with author and capped excerpt and queues scoring", async () => {
