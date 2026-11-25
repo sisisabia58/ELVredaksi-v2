@@ -58,7 +58,7 @@ const TICK_BUDGET_MS = 45_000;
 const CONCURRENCY = 4;
 const DESIGNER_SLOTS = 2;
 const RATE_LIMIT_ATTEMPTS = 8;
-const GEMINI_JOBS: Set<JobName> = new Set(["analyst.score", "copywriter.write"]);
+const GEMINI_JOBS: Set<JobName> = new Set(["analyst.score", "copywriter.write", "designer.cover"]);
 
 function calendarParts(date: Date, timeZone: string) {
   const fmt = new Intl.DateTimeFormat("en-GB", {

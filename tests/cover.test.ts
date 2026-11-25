@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTestSql } from "../src/db/client";
+import { LlmRateLimitError, ScriptedLlm } from "../src/llm/provider";
 import { seedDefaults } from "../src/db/seed";
 import { SLIDE_TEMPLATES } from "../src/domain/brand";
 import { runCoverJob, runDesigner, runPublisher } from "../src/jobs/handlers";
@@ -113,7 +114,10 @@ describe("runCoverJob", () => {
     expect(row[0]).toMatchObject({ cover_type: "image/png", cover_ai: true, cover_pending: false });
     expect(Number(row[0].size)).toBeGreaterThan(0);
     const spend = await sql.rows<{ agent: string; model: string }>("select agent, model from llm_spend");
-    expect(spend).toEqual([{ agent: "designer", model: "demo" }]);
+    expect(spend).toEqual([
+      { agent: "designer", model: "demo" },
+      { agent: "designer", model: "demo" },
+    ]);
     expect(await jobs(sql, "designer.render")).toEqual([{ payload: { draftId: DRAFT }, manual: true }]);
   });
 
@@ -325,5 +329,73 @@ describe("AI badge placement", () => {
       focalY: 50, photoDataUrl: null, aiCover: true,
     });
     expect(html).toMatch(/position:fixed;right:72px;bottom:28px/);
+  });
+});
+
+describe("cover concept from the article", () => {
+  class CapturingProvider implements ImageProvider {
+    seen: CoverRequest[] = [];
+    async cover(req: CoverRequest) {
+      this.seen.push(req);
+      return new DemoImageProvider().cover(req);
+    }
+  }
+
+  async function approvedWithExcerpt(excerpt: string) {
+    const sql = await seed("approved");
+    await sql.rows("update topics set excerpt = $1 where id = $2", [excerpt, TOPIC]);
+    await sql.rows("update drafts set cover_pending = true where id = $1", [DRAFT]);
+    return sql;
+  }
+
+  it("feeds a scene drawn from the article text to the image model", async () => {
+    const sql = await approvedWithExcerpt("Petani di Karawang mengeluh stok gabah menipis di lumbung.");
+    const asked: { user: string }[] = [];
+    const llm = {
+      async complete(req: { purpose: string; user: string }) {
+        asked.push(req);
+        return { text: '{"concept":"A farmer beside a half-empty grain silo at dawn"}', costUsd: 0.0001, model: "scripted" };
+      },
+    };
+    const provider = new CapturingProvider();
+    await runCoverJob({ sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: provider, llm });
+    expect(provider.seen[0]?.concept).toBe("A farmer beside a half-empty grain silo at dawn");
+    expect(asked[0]?.user).toContain("Kenapa tim kecil menang");
+    expect(asked[0]?.user).toContain("gabah menipis");
+    const spend = await sql.rows<{ model: string }>("select model from llm_spend order by model");
+    expect(spend.map((row) => row.model)).toEqual(["demo", "scripted"]);
+  });
+
+  it("uses the geometric cover rather than an unrelated picture when no scene can be made", async () => {
+    const sql = await approvedWithExcerpt("isi");
+    const provider = new CapturingProvider();
+    await runCoverJob({
+      sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: provider,
+      llm: new ScriptedLlm(["bukan json"]),
+    });
+    expect(provider.seen).toHaveLength(0);
+    const row = await sql.rows<{ cover_ai: boolean; cover_pending: boolean }>("select cover_ai, cover_pending from drafts");
+    expect(row[0]).toEqual({ cover_ai: false, cover_pending: false });
+    const log = await sql.rows<{ message: string }>("select message from activity where agent = 'designer'");
+    expect(log[0].message).toMatch(/geometris/);
+  });
+
+  it("retries later on a rate limit without using today's cover allowance", async () => {
+    const sql = await approvedWithExcerpt("isi");
+    const llm = { async complete(): Promise<never> { throw new LlmRateLimitError(5000); } };
+    await expect(
+      runCoverJob({ sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: new CapturingProvider(), llm }),
+    ).rejects.toBeInstanceOf(LlmRateLimitError);
+    expect((await sql.rows<{ cover_pending: boolean }>("select cover_pending from drafts"))[0].cover_pending).toBe(true);
+    expect(await sql.rows("select day from cover_quota")).toHaveLength(0);
+  });
+
+  it("skips the language model entirely when the daily cap is 0", async () => {
+    process.env.MAX_AI_COVERS_PER_DAY = "0";
+    const sql = await approvedWithExcerpt("isi");
+    let called = 0;
+    const llm = { async complete() { called += 1; return { text: "{}", costUsd: 0, model: "x" }; } };
+    await runCoverJob({ sql, payload: { draftId: DRAFT }, manual: false, now: NOW, imageProvider: new CapturingProvider(), llm });
+    expect(called).toBe(0);
   });
 });

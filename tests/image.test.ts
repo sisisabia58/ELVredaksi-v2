@@ -1,6 +1,7 @@
 import sharp from "sharp";
+import { DemoLlm } from "../src/llm/provider";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { coverPrompt } from "../src/image/cover-prompt";
+import { coverConceptSystem, coverConceptUser, coverPrompt, parseConcept } from "../src/image/cover-prompt";
 import {
   CloudflareImageProvider,
   DemoImageProvider,
@@ -35,6 +36,44 @@ describe("coverPrompt", () => {
   });
   it("stays under 2000 characters even for a very long niche", () => {
     expect(coverPrompt({ ...req, niche: "x".repeat(500) }).length).toBeLessThanOrEqual(2000);
+  });
+});
+
+describe("cover concept", () => {
+  it("puts the concept in the image prompt but still not the headline", () => {
+    const prompt = coverPrompt({ ...req, concept: "A farmer holding rice stalks beside a half-empty grain silo" });
+    expect(prompt).toContain("A farmer holding rice stalks beside a half-empty grain silo");
+    expect(prompt).not.toContain("Kenapa tim kecil menang");
+    for (const phrase of ["no text", "no logos", "no real people"]) {
+      expect(prompt).toContain(phrase);
+    }
+    expect(coverPrompt({ ...req, concept: "x".repeat(1000) }).length).toBeLessThanOrEqual(2000);
+  });
+
+  it("asks the model for one concrete, text-free scene as json", () => {
+    const system = coverConceptSystem("keuangan pribadi");
+    expect(system).toContain("keuangan pribadi");
+    expect(system).toContain("concept");
+    expect(system).toMatch(/single sentence/i);
+    expect(system).toMatch(/no text/i);
+    const user = coverConceptUser("Harga beras naik", "x".repeat(5000));
+    expect(user).toContain("Harga beras naik");
+    expect(user.length).toBeLessThan(2000);
+  });
+
+  it("parses a valid concept and rejects empty, missing or non-json output", () => {
+    expect(parseConcept('{"concept":"A small boat racing a large ship on calm water."}')).toBe(
+      "A small boat racing a large ship on calm water.",
+    );
+    expect(parseConcept(JSON.stringify({ concept: 'A "quoted" scene of a worker at a desk' }))).not.toContain('"');
+    expect(() => parseConcept('{"concept":""}')).toThrow();
+    expect(() => parseConcept('{"x":1}')).toThrow();
+    expect(() => parseConcept("not json")).toThrow();
+  });
+
+  it("is produced by the demo llm", async () => {
+    const result = await new DemoLlm().complete({ purpose: "cover", system: "", user: "" });
+    expect(parseConcept(result.text).length).toBeGreaterThan(10);
   });
 });
 

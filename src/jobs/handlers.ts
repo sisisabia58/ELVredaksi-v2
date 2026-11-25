@@ -24,7 +24,7 @@ import { renderSlideHtml, safePhotoDataUrl, slidesForFormat, type SlideTemplate 
 import { defaultLogoDataUrl } from "../render/brand-logo";
 import { dataUrlFromBytes } from "../rss/image-cache";
 import { PlaywrightRasterizer, type Rasterizer } from "../render/raster";
-import { createLlm, type LlmProvider } from "../llm/provider";
+import { LlmRateLimitError, createLlm, type LlmProvider } from "../llm/provider";
 import { fetchPublicText, PRIVATE_FETCH_MESSAGE } from "../rss/fetch-guard";
 import { excerptFromHtml, titleFromHtml } from "../rss/excerpt";
 import { parseFeed } from "../rss/parse";
@@ -45,6 +45,7 @@ import { autoRendersUsed, maxAutoRendersPerDay, reserveAutoRender } from "./rend
 import { maxAiCoversPerDay, reserveAiCover } from "./cover-quota";
 import { templateShowsCoverImage } from "../domain/brand";
 import { createImageProvider, type ImageProvider } from "../image/provider";
+import { coverConceptSystem, coverConceptUser, parseConcept } from "../image/cover-prompt";
 
 export type ScoutCtx = JobCtx & {
   fetchFeed: (url: string) => Promise<string>;
@@ -1158,7 +1159,7 @@ export async function runDesigner(ctx: DesignerCtx): Promise<void> {
 }
 
 
-export type CoverCtx = JobCtx & { imageProvider?: ImageProvider };
+export type CoverCtx = JobCtx & { imageProvider?: ImageProvider; llm?: LlmProvider };
 
 /**
  * Makes the AI cover for a draft a person already approved. Every outcome clears
@@ -1177,9 +1178,13 @@ export async function runCoverJob(ctx: CoverCtx): Promise<void> {
     cover_ai: boolean;
     niche: string;
     accent: string;
+    excerpt: string;
+    summary: string;
   }>(
-    `select d.status, d.template, d.slides, d.cover_ai, b.niche, b.accent
-     from drafts d cross join brand b
+    `select d.status, d.template, d.slides, d.cover_ai, b.niche, b.accent, t.excerpt, t.summary
+     from drafts d
+     join topics t on t.id = d.topic_id
+     cross join brand b
      where d.id = $1 and b.id = 1`,
     [draftId],
   );
@@ -1220,23 +1225,43 @@ export async function runCoverJob(ctx: CoverCtx): Promise<void> {
   };
 
   const cap = maxAiCoversPerDay();
-  if (!(await reserveAiCover(ctx.sql, ctx.now, cap))) {
-    await note(
-      cap === 0
-        ? `Cover AI dimatikan (MAX_AI_COVERS_PER_DAY=0), "${headline}" memakai cover geometris`
-        : `Batas ${cap} cover AI hari ini tercapai, "${headline}" memakai cover geometris`,
-    );
+  if (cap <= 0) {
+    await note(`Cover AI dimatikan (MAX_AI_COVERS_PER_DAY=0), "${headline}" memakai cover geometris`);
     await finish(true);
     return;
   }
 
   try {
+    // First a scene drawn from the article, so the picture reflects the story. A rate limit
+    // propagates (the job retries later, before any allowance is spent). Any other failure
+    // means no cover rather than an unrelated one.
+    const llm = ctx.llm ?? createLlm();
+    const sceneResult = await llm.complete({
+      purpose: "cover",
+      system: coverConceptSystem(draft.niche),
+      user: coverConceptUser(headline, `${draft.excerpt} ${draft.summary}`),
+    });
+    await ctx.sql.rows(`insert into llm_spend (id, agent, model, cost_usd) values ($1, $2, $3, $4)`, [
+      randomUUID(),
+      "designer",
+      sceneResult.model,
+      sceneResult.costUsd,
+    ]);
+    const concept = parseConcept(sceneResult.text);
+
+    if (!(await reserveAiCover(ctx.sql, ctx.now, cap))) {
+      await note(`Batas ${cap} cover AI hari ini tercapai, "${headline}" memakai cover geometris`);
+      await finish(true);
+      return;
+    }
+
     const provider = ctx.imageProvider ?? createImageProvider();
     const result = await provider.cover({
       headline,
       kicker: cover?.kicker ?? "",
       niche: draft.niche,
       accent: draft.accent,
+      concept,
     });
     await ctx.sql.tx(async (tx) => {
       await tx.rows(
@@ -1255,6 +1280,9 @@ export async function runCoverJob(ctx: CoverCtx): Promise<void> {
     await note(`Cover AI selesai untuk "${headline}"`);
     await finish(true);
   } catch (error) {
+    if (error instanceof LlmRateLimitError) {
+      throw error;
+    }
     const detail = (error instanceof Error ? error.message : String(error)).slice(0, 200);
     console.warn(`[designer] AI cover failed for draft ${draftId}: ${detail}`);
     await note(`Cover AI gagal untuk "${headline}", memakai cover geometris`);

@@ -6,7 +6,7 @@ import {
   recordGeminiPause,
 } from "./gemini-gate";
 
-export type LlmRequest = { purpose: "score" | "copy"; system: string; user: string };
+export type LlmRequest = { purpose: "score" | "copy" | "cover"; system: string; user: string };
 
 export type LlmResult = { text: string; costUsd: number; model: string };
 
@@ -59,6 +59,13 @@ function demoScorePayload(user: string): Record<string, unknown> {
 
 export class DemoLlm implements LlmProvider {
   async complete(req: LlmRequest): Promise<LlmResult> {
+    if (req.purpose === "cover") {
+      return {
+        text: JSON.stringify({ concept: "A small sailboat racing ahead of a large cargo ship on calm water at sunrise" }),
+        costUsd: 0,
+        model: "demo",
+      };
+    }
     if (req.purpose === "score") {
       return {
         text: JSON.stringify(demoScorePayload(req.user)),
@@ -159,6 +166,12 @@ const SCORE_RESPONSE_SCHEMA = {
     reason: { type: "STRING" },
   },
   required: ["aspects", "tags", "sensitive", "sensitiveReason", "blocked", "reason"],
+};
+
+const CONCEPT_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: { concept: { type: "STRING" } },
+  required: ["concept"],
 };
 
 const COPY_RESPONSE_SCHEMA = {
@@ -285,7 +298,12 @@ export class GeminiLlm implements LlmProvider {
             contents: [{ role: "user", parts: [{ text: req.user }] }],
             generationConfig: {
               responseMimeType: "application/json",
-              responseSchema: req.purpose === "score" ? SCORE_RESPONSE_SCHEMA : COPY_RESPONSE_SCHEMA,
+              responseSchema:
+                req.purpose === "score"
+                  ? SCORE_RESPONSE_SCHEMA
+                  : req.purpose === "cover"
+                    ? CONCEPT_RESPONSE_SCHEMA
+                    : COPY_RESPONSE_SCHEMA,
             },
           }),
           signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),

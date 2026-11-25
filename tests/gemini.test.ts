@@ -105,6 +105,22 @@ describe("gemini provider", () => {
     expect(body.generationConfig.responseSchema.properties.aspects).toBeTruthy();
   });
 
+  it("asks for a concept object when the purpose is cover", async () => {
+    setEnv("GEMINI_API_KEY", "test-key");
+    const bodies: string[] = [];
+    const llm = new GeminiLlm(async (_url, init) => {
+      bodies.push(init.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ candidates: [{ content: { parts: [{ text: '{"concept":"x"}' }] } }] }),
+      };
+    });
+    await llm.complete({ purpose: "cover", system: "s", user: "u" });
+    const body = JSON.parse(bodies[0] ?? "{}") as { generationConfig: { responseSchema: { properties: Record<string, unknown> } } };
+    expect(Object.keys(body.generationConfig.responseSchema.properties)).toEqual(["concept"]);
+  });
+
   it("uses GEMINI_MODEL and turns a rate limit into a backoff error", async () => {
     setEnv("GEMINI_API_KEY", "test-key");
     setEnv("GEMINI_MODEL", "gemini-2.5-flash");
