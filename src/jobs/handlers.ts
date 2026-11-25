@@ -1,0 +1,1678 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { parseCopy, type Slide } from "../agents/copywriter";
+import { analystSystem, copySystem } from "../agents/prompts";
+import { scoreTopic } from "../agents/analyst";
+import { openAccessToken, isSealedAccessToken } from "../auth/token-cipher";
+import { makeShortCode } from "../domain/code";
+import {
+  INSIGHTS_INTERVAL_MS,
+  PASS_THRESHOLD_DEFAULT,
+  SCOUT_INTERVAL_MS,
+  TIME_ZONE,
+} from "../domain/constants";
+import { publicUrlPublishError, resolvePublicBaseUrl } from "../domain/public-url";
+import { bearerInit, graphUrl, type GraphHost } from "../instagram/graph";
+import { fetchInstagramPermalink } from "../instagram/permalink";
+import { IG_REFRESH_INTERVAL_MS, TOKEN_RECONNECT, refreshStoredInstagramToken } from "../instagram/token";
+import { assertTransition, type DraftStatus } from "../domain/status";
+import { totalScore, verdict } from "../domain/score";
+import { PUBLISH_DISCONNECTED, TOKEN_UNREADABLE_PUBLISH, readPracticeMode } from "../publish/mode";
+import { FakePublisher, MetaPublisher, type Publisher, type PublishResult } from "../publish/publisher";
+import { clampSlideCount } from "../domain/brand";
+import { renderSlideHtml, safePhotoDataUrl, slidesForFormat, type SlideTemplate } from "../render/html";
+import { defaultLogoDataUrl } from "../render/brand-logo";
+import { dataUrlFromBytes, cachedImageDataUrl } from "../rss/image-cache";
+import { PlaywrightRasterizer, type Rasterizer } from "../render/raster";
+import { createLlm, type LlmProvider } from "../llm/provider";
+import { fetchPublicText, PRIVATE_FETCH_MESSAGE } from "../rss/fetch-guard";
+import { excerptFromHtml, imageUrlFromHtml } from "../rss/excerpt";
+import { parseFeed } from "../rss/parse";
+import { normalizeInsights, type DailyPoint } from "../studio/analytics";
+import { validateCoverPhotoDataUrl, withLockedDraftEdit } from "../studio/drafts";
+import { enqueue, type JobCtx } from "./runner";
+import { autoRendersUsed, maxAutoRendersPerDay, reserveAutoRender } from "./render-quota";
+
+export type ScoutCtx = JobCtx & {
+  fetchFeed: (url: string) => Promise<string>;
+  fetchPage: (url: string) => Promise<string>;
+};
+
+async function hasQueuedScoutScan(sql: JobCtx["sql"]): Promise<boolean> {
+  const rows = await sql.rows<{ id: string }>(
+    `select id from jobs
+     where name = 'scout.scan' and finished_at is null and locked_at is null
+     limit 1`,
+  );
+  return rows.length > 0;
+}
+
+export async function runScout(ctx: ScoutCtx): Promise<void> {
+  const sources = await ctx.sql.rows<{ id: string; url: string }>(
+    `select id, url from sources where enabled = true order by name`,
+  );
+
+  let newTopicCount = 0;
+
+  for (const source of sources) {
+    try {
+      const xml = await ctx.fetchFeed(source.url);
+      const items = parseFeed(xml);
+
+      for (const item of items) {
+        const known = await ctx.sql.rows<{ id: string }>(
+          `select id from topics where url = $1 limit 1`,
+          [item.url],
+        );
+        if (known.length > 0) {
+          if (item.imageUrl && known[0]) {
+            const filled = await ctx.sql.rows<{ id: string }>(
+              `update topics set image_url = $1
+               where id = $2 and coalesce(image_url, '') = ''
+               returning id`,
+              [item.imageUrl, known[0].id],
+            );
+            if (filled[0]) {
+              await ctx.sql.rows(
+                `update drafts set text_dirty = true, updated_at = $1
+                 where topic_id = $2 and status in ('needs_review', 'drafted')`,
+                [ctx.now, known[0].id],
+              );
+            }
+          }
+          continue;
+        }
+
+        let excerpt = "";
+        let imageUrl = item.imageUrl;
+        try {
+          const html = await ctx.fetchPage(item.url);
+          excerpt = excerptFromHtml(html);
+          if (!imageUrl) {
+            imageUrl = imageUrlFromHtml(html, item.url);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message === PRIVATE_FETCH_MESSAGE) {
+            continue;
+          }
+          excerpt = "";
+        }
+
+        await ctx.sql.tx(async (tx) => {
+          const inserted = await tx.rows<{ id: string }>(
+            `insert into topics (id, source_id, title, url, summary, excerpt, published_at, image_url)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
+             on conflict (url) do nothing
+             returning id`,
+            [
+              randomUUID(),
+              source.id,
+              item.title,
+              item.url,
+              item.summary,
+              excerpt,
+              item.publishedAt,
+              imageUrl,
+            ],
+          );
+          if (inserted[0]) {
+            newTopicCount += 1;
+            await enqueue(tx, {
+              name: "analyst.score",
+              payload: { topicId: inserted[0].id },
+              runAt: ctx.now,
+              manual: ctx.manual,
+            });
+          }
+        });
+      }
+
+      await ctx.sql.rows(
+        `update sources set last_error = null, last_fetched_at = $1 where id = $2`,
+        [ctx.now, source.id],
+      );
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+      await ctx.sql.rows(`update sources set last_error = $1 where id = $2`, [message, source.id]);
+    }
+  }
+
+  const activityMessage =
+    newTopicCount > 0 ? `Menemukan ${newTopicCount} topik baru` : "Belum ada topik baru";
+  await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+    randomUUID(),
+    "scout",
+    activityMessage,
+  ]);
+
+  if (!(await hasQueuedScoutScan(ctx.sql))) {
+    await enqueue(ctx.sql, {
+      name: "scout.scan",
+      payload: {},
+      runAt: new Date(ctx.now.getTime() + SCOUT_INTERVAL_MS),
+      manual: false,
+    });
+  }
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<string> {
+  return fetchPublicText(url, timeoutMs);
+}
+
+async function runScoutCron(ctx: JobCtx): Promise<void> {
+  const timeoutMs = 8000;
+  return runScout({
+    ...ctx,
+    fetchFeed: (url) => fetchWithTimeout(url, timeoutMs),
+    fetchPage: (url) => fetchWithTimeout(url, timeoutMs),
+  });
+}
+
+export type AnalystCtx = JobCtx & { llm?: LlmProvider };
+
+async function loadPassThreshold(sql: JobCtx["sql"]): Promise<number> {
+  const rows = await sql.rows<{ pass_threshold: number }>(
+    "select pass_threshold from brand where id = 1",
+  );
+  return rows[0]?.pass_threshold ?? PASS_THRESHOLD_DEFAULT;
+}
+
+async function loadBrain(sql: JobCtx["sql"]): Promise<string> {
+  const docs = await sql.rows<{ title: string; body: string }>(
+    "select title, body from brain_docs order by slug",
+  );
+  return docs.map((d) => `## ${d.title}\n${d.body}`).join("\n\n");
+}
+
+function formatPublished(at: Date | null | undefined): string {
+  if (!at) {
+    return "tidak diketahui";
+  }
+  return at.toISOString();
+}
+
+async function scoreOneTopic(
+  ctx: AnalystCtx,
+  llm: LlmProvider,
+  topicId: string,
+): Promise<{ passed: boolean; valid: boolean }> {
+  const topics = await ctx.sql.rows<{
+    id: string;
+    title: string;
+    url: string;
+    summary: string;
+    excerpt: string;
+    published_at: Date | null;
+    state: string;
+    source_name: string;
+  }>(
+    `select t.id, t.title, t.url, t.summary, t.excerpt, t.published_at, t.state, s.name as source_name
+     from topics t
+     join sources s on s.id = t.source_id
+     where t.id = $1`,
+    [topicId],
+  );
+  const topic = topics[0];
+  if (!topic || topic.state !== "new") {
+    return { passed: false, valid: false };
+  }
+
+  const brain = await loadBrain(ctx.sql);
+  const user = [
+    `Judul: ${topic.title}`,
+    `URL: ${topic.url}`,
+    `Sumber: ${topic.source_name}`,
+    `Diterbitkan: ${formatPublished(topic.published_at)}`,
+    `Ringkasan: ${topic.summary}`,
+    `Cuplikan: ${topic.excerpt}`,
+  ].join("\n");
+
+  const result = await llm.complete({
+    purpose: "score",
+    system: analystSystem(brain),
+    user,
+  });
+
+  await ctx.sql.rows(
+    `insert into llm_spend (id, agent, model, cost_usd) values ($1, $2, $3, $4)`,
+    [randomUUID(), "analis", result.model, result.costUsd],
+  );
+
+  let scored;
+  try {
+    scored = scoreTopic(result.text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "skor tidak valid";
+    const failed = await ctx.sql.rows<{ id: string }>(
+      `update topics set state = 'failed', error = $1 where id = $2 and state = 'new' returning id`,
+      [message, topicId],
+    );
+    if (failed.length === 0) {
+      return { passed: false, valid: false };
+    }
+    await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+      randomUUID(),
+      "analis",
+      `Gagal menilai "${topic.title}"`,
+    ]);
+    return { passed: false, valid: false };
+  }
+
+  const threshold = await loadPassThreshold(ctx.sql);
+  const score = totalScore(scored.aspects);
+  const blocked = scored.blocked;
+  const passed = !blocked && verdict(score, threshold) === "lolos";
+  const state = blocked || verdict(score, threshold) === "dilewati" ? "skipped" : "passed";
+
+  const applied = await ctx.sql.tx(async (tx) => {
+    const updated = await tx.rows<{ id: string }>(
+      `update topics set
+         state = $1,
+         score = $2,
+         aspects = $3::jsonb,
+         tags = $4::jsonb,
+         sensitive = $5,
+         sensitive_reason = $6,
+         blocked = $7,
+         score_reason = $8,
+         scored_at = $9,
+         error = null
+       where id = $10 and state = 'new'
+       returning id`,
+      [
+        state,
+        score,
+        JSON.stringify(scored.aspects),
+        JSON.stringify(scored.tags),
+        scored.sensitive,
+        scored.sensitiveReason,
+        blocked,
+        scored.reason,
+        ctx.now,
+        topicId,
+      ],
+    );
+    if (updated.length === 0) {
+      return false;
+    }
+    if (passed) {
+      const pending = await tx.rows<{ id: string }>(
+        `select id from jobs
+         where name = 'copywriter.write'
+           and finished_at is null
+           and payload->>'topicId' = $1
+         limit 1`,
+        [topicId],
+      );
+      if (pending.length === 0) {
+        await enqueue(tx, {
+          name: "copywriter.write",
+          payload: { topicId },
+          runAt: ctx.now,
+          manual: false,
+        });
+      }
+    }
+    return true;
+  });
+
+  if (!applied) {
+    return { passed: false, valid: false };
+  }
+  return { passed, valid: true };
+}
+
+export async function runAnalyst(ctx: AnalystCtx): Promise<void> {
+  const llm = ctx.llm ?? createLlm();
+  const threshold = await loadPassThreshold(ctx.sql);
+
+  if (ctx.payload.rescoreWaiting === true) {
+    const waiting = await ctx.sql.rows<{ id: string }>(
+      `select id from topics where state = 'new' order by discovered_at asc limit 20`,
+    );
+    let validCount = 0;
+    let passedCount = 0;
+    for (const row of waiting) {
+      const outcome = await scoreOneTopic(ctx, llm, row.id);
+      if (outcome.valid) {
+        validCount += 1;
+        if (outcome.passed) {
+          passedCount += 1;
+        }
+      }
+    }
+    if (validCount > 0) {
+      await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+        randomUUID(),
+        "analis",
+        `Menilai ${validCount} topik, ${passedCount} lolos ambang skor ${threshold}`,
+      ]);
+    }
+    return;
+  }
+
+  const topicId = ctx.payload.topicId;
+  if (typeof topicId !== "string" || !topicId) {
+    return;
+  }
+
+  const outcome = await scoreOneTopic(ctx, llm, topicId);
+  if (outcome.valid) {
+    await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+      randomUUID(),
+      "analis",
+      `Menilai 1 topik, ${outcome.passed ? 1 : 0} lolos ambang skor ${threshold}`,
+    ]);
+  }
+}
+
+export type CopywriterCtx = JobCtx & { llm?: LlmProvider };
+
+function isUniqueViolation(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const code = (error as { code?: string }).code;
+    if (code === "23505") {
+      return true;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (/unique/i.test(message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function loadBrandDefaults(
+  sql: JobCtx["sql"],
+): Promise<{ format: string; template: string; slideCount: number; handle: string }> {
+  const rows = await sql.rows<{
+    default_format: string;
+    default_template: string;
+    slide_count: number;
+    handle: string;
+  }>("select default_format, default_template, slide_count, handle from brand where id = 1");
+  return {
+    format: rows[0]?.default_format ?? "carousel_full",
+    template: rows[0]?.default_template ?? "berita_pro",
+    slideCount: clampSlideCount(rows[0]?.slide_count),
+    handle: rows[0]?.handle ?? "",
+  };
+}
+
+function slidesKeepingCoverPhoto(nextSlides: Slide[], stored: unknown): Slide[] {
+  const parsed = (typeof stored === "string" ? JSON.parse(stored) : stored) as (Slide & {
+    photoDataUrl?: string;
+  })[];
+  if (!Array.isArray(parsed)) {
+    return nextSlides;
+  }
+  const cover = parsed.find((slide) => slide.role === "cover") ?? parsed[0];
+  const raw = cover?.photoDataUrl;
+  if (typeof raw !== "string" || raw.length === 0) {
+    return nextSlides;
+  }
+  try {
+    const photo = validateCoverPhotoDataUrl(raw);
+    return nextSlides.map((slide) => (slide.role === "cover" ? { ...slide, photoDataUrl: photo } : slide));
+  } catch {
+    return nextSlides;
+  }
+}
+
+async function topicDraftIsFrozen(sql: JobCtx["sql"], topicId: string): Promise<boolean> {
+  const rows = await sql.rows<{ id: string }>(
+    `select id from drafts
+     where topic_id = $1 and status in ('posting', 'posted', 'simulasi')
+     limit 1`,
+    [topicId],
+  );
+  return rows.length > 0;
+}
+
+async function draftStatusForTopic(
+  sql: JobCtx["sql"],
+  topicId: string,
+): Promise<{ id: string; status: string; slides: unknown } | null> {
+  const rows = await sql.rows<{ id: string; status: string; slides: unknown }>(
+    "select id, status, slides from drafts where topic_id = $1 limit 1",
+    [topicId],
+  );
+  return rows[0] ?? null;
+}
+
+async function topicNeedsFreshScore(sql: JobCtx["sql"], topicId: string): Promise<boolean> {
+  const rows = await sql.rows<{ score: number | null; score_reason: string | null }>(
+    "select score, score_reason from topics where id = $1",
+    [topicId],
+  );
+  const row = rows[0];
+  if (!row || row.score == null) {
+    return true;
+  }
+  return String(row.score_reason ?? "").includes("(demo)");
+}
+
+async function rewriteDemoReviewDraft(
+  ctx: CopywriterCtx,
+  llm: LlmProvider,
+  topic: {
+    id: string;
+    title: string;
+    url: string;
+    summary: string;
+    excerpt: string;
+    published_at: Date | null;
+    source_name: string;
+  },
+): Promise<void> {
+  const existing = await draftStatusForTopic(ctx.sql, topic.id);
+  if (!existing || existing.status !== "needs_review") {
+    return;
+  }
+
+  const brain = await loadBrain(ctx.sql);
+  const user = [
+    `Judul: ${topic.title}`,
+    `URL: ${topic.url}`,
+    `Sumber: ${topic.source_name}`,
+    `Diterbitkan: ${formatPublished(topic.published_at)}`,
+    `Ringkasan: ${topic.summary}`,
+    `Cuplikan: ${topic.excerpt}`,
+  ].join("\n");
+
+  // A real score is already on the topic. Scoring again would spend a second
+  // Gemini request and the copy is the only part still missing.
+  if (await topicNeedsFreshScore(ctx.sql, topic.id)) {
+    const scoredResult = await llm.complete({
+      purpose: "score",
+      system: analystSystem(brain),
+      user,
+    });
+    await ctx.sql.rows(
+      `insert into llm_spend (id, agent, model, cost_usd) values ($1, $2, $3, $4)`,
+      [randomUUID(), "analis", scoredResult.model, scoredResult.costUsd],
+    );
+    const scored = scoreTopic(scoredResult.text);
+    const score = totalScore(scored.aspects);
+    const scoredRows = await ctx.sql.rows<{ id: string }>(
+      `update topics set
+         score = $1,
+         aspects = $2::jsonb,
+         tags = $3::jsonb,
+         sensitive = $4,
+         sensitive_reason = $5,
+         blocked = $6,
+         score_reason = $7,
+         scored_at = $8,
+         error = null
+       where id = $9 and state = 'drafted'
+       returning id`,
+      [
+        score,
+        JSON.stringify(scored.aspects),
+        JSON.stringify(scored.tags),
+        scored.sensitive,
+        scored.sensitiveReason,
+        scored.blocked,
+        scored.reason,
+        ctx.now,
+        topic.id,
+      ],
+    );
+    if (scoredRows.length === 0) {
+      return;
+    }
+  }
+
+  const stillReview = await draftStatusForTopic(ctx.sql, topic.id);
+  if (!stillReview || stillReview.status !== "needs_review") {
+    return;
+  }
+
+  const brand = await loadBrandDefaults(ctx.sql);
+  const copyResult = await llm.complete({
+    purpose: "copy",
+    system: copySystem(brain, { slideCount: brand.slideCount, handle: brand.handle }),
+    user,
+  });
+  await ctx.sql.rows(
+    `insert into llm_spend (id, agent, model, cost_usd) values ($1, $2, $3, $4)`,
+    [randomUUID(), "copywriter", copyResult.model, copyResult.costUsd],
+  );
+  const copy = parseCopy(copyResult.text, topic.source_name);
+  const slides = slidesKeepingCoverPhoto(copy.slides, stillReview.slides);
+  const updated = await ctx.sql.rows<{ id: string }>(
+    `update drafts set
+       slides = $1::jsonb,
+       caption = $2,
+       hashtags = $3::jsonb,
+       alt_headlines = $4::jsonb,
+       text_dirty = true,
+       status = 'needs_review',
+       updated_at = clock_timestamp()
+     where id = $5 and status = 'needs_review'
+     returning id`,
+    [
+      JSON.stringify(slides),
+      copy.caption,
+      JSON.stringify(copy.hashtags),
+      JSON.stringify(copy.altHeadlines),
+      stillReview.id,
+    ],
+  );
+  if (updated.length === 0) {
+    return;
+  }
+  const coverHeadline = copy.slides[0]?.headline ?? topic.title;
+  await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+    randomUUID(),
+    "copywriter",
+    `Naskah demo ditulis ulang: "${coverHeadline}"`,
+  ]);
+  await enqueue(ctx.sql, {
+    name: "designer.render",
+    payload: { draftId: stillReview.id },
+    runAt: ctx.now,
+    manual: true,
+  });
+}
+
+export async function runCopywriter(ctx: CopywriterCtx): Promise<void> {
+  const llm = ctx.llm ?? createLlm();
+  const topicId = ctx.payload.topicId;
+  if (typeof topicId !== "string" || !topicId) {
+    return;
+  }
+
+  const topics = await ctx.sql.rows<{
+    id: string;
+    title: string;
+    url: string;
+    summary: string;
+    excerpt: string;
+    published_at: Date | null;
+    state: string;
+    source_name: string;
+  }>(
+    `select t.id, t.title, t.url, t.summary, t.excerpt, t.published_at, t.state, s.name as source_name
+     from topics t
+     join sources s on s.id = t.source_id
+     where t.id = $1`,
+    [topicId],
+  );
+  const topic = topics[0];
+  if (!topic) {
+    throw new Error("topik tidak ditemukan");
+  }
+
+  if (ctx.payload.regenerateDemo === true) {
+    await rewriteDemoReviewDraft(ctx, llm, topic);
+    return;
+  }
+
+  const force = ctx.payload.force === true;
+  if ((topic.state === "skipped" || topic.state === "failed") && !force) {
+    return;
+  }
+
+  const rewrite = ctx.payload.rewrite === true;
+  if (rewrite && (await topicDraftIsFrozen(ctx.sql, topicId))) {
+    return;
+  }
+  if (!rewrite) {
+    const already = await ctx.sql.rows<{ id: string }>(
+      "select id from drafts where topic_id = $1 limit 1",
+      [topicId],
+    );
+    if (already[0]) {
+      return;
+    }
+  }
+
+  // An automatic draft exists only to be rendered. Once today's automatic image
+  // allowance is used, leave the topic as passed (a person can still draft it)
+  // instead of spending Gemini on a draft that would never get its slides.
+  if (!ctx.manual && !rewrite) {
+    const cap = maxAutoRendersPerDay();
+    if ((await autoRendersUsed(ctx.sql, ctx.now)) >= cap) {
+      const message =
+        cap === 0
+          ? `Draft otomatis dimatikan (MAX_IMAGE_GENERATIONS_PER_DAY=0), "${topic.title}" dilewati`
+          : `Batas ${cap} gambar otomatis hari ini tercapai, draft "${topic.title}" dilewati`;
+      console.info(`[copywriter] ${message}`);
+      await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+        randomUUID(),
+        "copywriter",
+        message,
+      ]);
+      return;
+    }
+  }
+
+  const brain = await loadBrain(ctx.sql);
+  const user = [
+    `Judul: ${topic.title}`,
+    `URL: ${topic.url}`,
+    `Sumber: ${topic.source_name}`,
+    `Diterbitkan: ${formatPublished(topic.published_at)}`,
+    `Ringkasan: ${topic.summary}`,
+    `Cuplikan: ${topic.excerpt}`,
+  ].join("\n");
+
+  const brand = await loadBrandDefaults(ctx.sql);
+  const result = await llm.complete({
+    purpose: "copy",
+    system: copySystem(brain, { slideCount: brand.slideCount, handle: brand.handle }),
+    user,
+  });
+
+  await ctx.sql.rows(
+    `insert into llm_spend (id, agent, model, cost_usd) values ($1, $2, $3, $4)`,
+    [randomUUID(), "copywriter", result.model, result.costUsd],
+  );
+
+  let copy: ReturnType<typeof parseCopy>;
+  try {
+    copy = parseCopy(result.text, topic.source_name);
+  } catch (error) {
+    if (rewrite && (await topicDraftIsFrozen(ctx.sql, topicId))) {
+      return;
+    }
+    const message = error instanceof Error ? error.message : "naskah tidak valid";
+    await ctx.sql.rows(`update topics set state = 'failed', error = $1 where id = $2`, [message, topicId]);
+    await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+      randomUUID(),
+      "copywriter",
+      `Gagal menulis "${topic.title}"`,
+    ]);
+    return;
+  }
+
+  const existingDrafts = await ctx.sql.rows<{ id: string }>(
+    "select id from drafts where topic_id = $1 limit 1",
+    [topicId],
+  );
+  const existingDraft = existingDrafts[0];
+
+  if (rewrite && existingDraft) {
+    const applied = await ctx.sql.tx(async (tx) => {
+      return withLockedDraftEdit(tx, existingDraft.id, "rewrite", async (locked, nextStatus) => {
+        const slides = slidesKeepingCoverPhoto(copy.slides, locked.slides);
+        return tx.rows<{ id: string }>(
+          `update drafts set
+             slides = $1::jsonb,
+             caption = $2,
+             hashtags = $3::jsonb,
+             alt_headlines = $4::jsonb,
+             text_dirty = true,
+             status = $5,
+             updated_at = clock_timestamp()
+           where id = $6 and status = $7
+           returning id`,
+          [
+            JSON.stringify(slides),
+            copy.caption,
+            JSON.stringify(copy.hashtags),
+            JSON.stringify(copy.altHeadlines),
+            nextStatus,
+            existingDraft.id,
+            locked.status,
+          ],
+        );
+      });
+    });
+    if (!applied) {
+      return;
+    }
+    await ctx.sql.rows(`update topics set state = 'drafted', error = null where id = $1`, [topicId]);
+    const coverHeadline = copy.slides[0]?.headline ?? topic.title;
+    await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+      randomUUID(),
+      "copywriter",
+      `Draft siap: "${coverHeadline}"`,
+    ]);
+    await enqueue(ctx.sql, {
+      name: "designer.render",
+      payload: { draftId: existingDraft.id },
+      runAt: ctx.now,
+      manual: ctx.manual,
+    });
+    return;
+  }
+
+  const slidesJson = JSON.stringify(copy.slides);
+  let draftId: string | null = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const id = randomUUID();
+    const shortCode = makeShortCode(randomBytes(5));
+    try {
+      const inserted = await ctx.sql.tx(async (tx) => {
+        await tx.rows(`select id from topics where id = $1 for update`, [topicId]);
+        const existing = await tx.rows<{ id: string }>(
+          "select id from drafts where topic_id = $1 limit 1",
+          [topicId],
+        );
+        if (existing[0]) {
+          return null;
+        }
+        await tx.rows(
+          `insert into drafts (
+             id, topic_id, status, format, template, slides, caption, hashtags, alt_headlines, focal_y, short_code, manual
+           ) values ($1, $2, 'drafted', $3, $4, $5::jsonb, $6, $7::jsonb, $8::jsonb, 50, $9, $10)`,
+          [
+            id,
+            topicId,
+            brand.format,
+            brand.template,
+            slidesJson,
+            copy.caption,
+            JSON.stringify(copy.hashtags),
+            JSON.stringify(copy.altHeadlines),
+            shortCode,
+            ctx.manual,
+          ],
+        );
+        await tx.rows(`update topics set state = 'drafted', error = null where id = $1`, [topicId]);
+        await enqueue(tx, {
+          name: "designer.render",
+          payload: { draftId: id },
+          runAt: ctx.now,
+          manual: ctx.manual,
+        });
+        return id;
+      });
+      if (inserted === null) {
+        return;
+      }
+      draftId = inserted;
+      break;
+    } catch (error) {
+      if (isUniqueViolation(error) && attempt < 4) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  if (!draftId) {
+    throw new Error("gagal membuat short_code unik");
+  }
+  const coverHeadline = copy.slides[0]?.headline ?? topic.title;
+  await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+    randomUUID(),
+    "copywriter",
+    `Draft siap: "${coverHeadline}"`,
+  ]);
+}
+
+export type DesignerCtx = JobCtx & { rasterizer?: Rasterizer };
+
+type SlideWithPhoto = Slide & { photoDataUrl?: string };
+
+function photoInputForSlide(
+  slide: Slide,
+  draftFocalY: number,
+): { photoDataUrl: string | null; focalY: number } {
+  if (slide.role !== "cover") {
+    return { photoDataUrl: null, focalY: draftFocalY };
+  }
+  const raw = (slide as SlideWithPhoto).photoDataUrl;
+  const photoDataUrl = safePhotoDataUrl(typeof raw === "string" ? raw : null);
+  return { photoDataUrl, focalY: draftFocalY };
+}
+
+class SupersededRenderError extends Error {
+  constructor() {
+    super("superseded render");
+    this.name = "SupersededRenderError";
+  }
+}
+
+// node-pg (and PGlite) return timestamptz as a JS Date, which drops microseconds.
+// Comparing the raw column to that Date never matches a Postgres now() value,
+// so the first render rolls back and the draft stays out of review.
+function sameUpdatedAt(param: string): string {
+  return `date_trunc('milliseconds', updated_at) = date_trunc('milliseconds', ${param}::timestamptz)`;
+}
+
+export async function runDesigner(ctx: DesignerCtx): Promise<void> {
+  const draftId = ctx.payload.draftId;
+  if (typeof draftId !== "string" || !draftId) {
+    throw new Error("draft tidak ditemukan");
+  }
+
+  const rows = await ctx.sql.rows<{
+    status: string;
+    format: string;
+    template: string;
+    slides: Slide[] | string;
+    focal_y: number;
+    source_name: string;
+    handle: string;
+    accent: string;
+    initial: string;
+    slide_count: number;
+    image_url: string | null;
+    logo: unknown;
+    logo_type: string | null;
+    updated_at: Date;
+  }>(
+    `select d.status, d.format, d.template, d.slides, d.focal_y, d.updated_at,
+            s.name as source_name, t.image_url, b.handle, b.accent, b.initial,
+            b.slide_count, b.logo, b.logo_type
+     from drafts d
+     join topics t on t.id = d.topic_id
+     join sources s on s.id = t.source_id
+     cross join brand b
+     where d.id = $1 and b.id = 1`,
+    [draftId],
+  );
+  const draft = rows[0];
+  if (!draft) {
+    throw new Error("draft tidak ditemukan");
+  }
+  if (draft.status === "posting" || draft.status === "posted" || draft.status === "simulasi") {
+    return;
+  }
+
+  // Automatic renders share a daily allowance. A retry or reclaimed run of the same
+  // job already took its slot, so failed attempts count once and never loop.
+  if (!ctx.manual && !ctx.reclaimed && (ctx.attempts ?? 0) === 0) {
+    const cap = maxAutoRendersPerDay();
+    if (!(await reserveAutoRender(ctx.sql, ctx.now, cap))) {
+      const headline = (typeof draft.slides === "string" ? (JSON.parse(draft.slides) as Slide[]) : draft.slides)[0]
+        ?.headline;
+      const message =
+        cap === 0
+          ? `Render otomatis dimatikan (MAX_IMAGE_GENERATIONS_PER_DAY=0), "${headline ?? "draft"}" dilewati`
+          : `Batas ${cap} gambar otomatis hari ini tercapai, "${headline ?? "draft"}" dilewati`;
+      console.info(`[designer] ${message} (draft ${draftId})`);
+      await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+        randomUUID(),
+        "designer",
+        message,
+      ]);
+      return;
+    }
+  }
+
+  const ownedRasterizer = ctx.rasterizer === undefined;
+  const rasterizer = ctx.rasterizer ?? new PlaywrightRasterizer();
+
+  const allSlides: Slide[] =
+    typeof draft.slides === "string" ? (JSON.parse(draft.slides) as Slide[]) : draft.slides;
+  const format = draft.format as "carousel_full" | "teaser_bio";
+  const template = draft.template as SlideTemplate;
+  const selected = slidesForFormat(format, allSlides, {
+    template,
+    slideCount: draft.slide_count,
+  });
+  const current = draft.status as DraftStatus;
+  const startedAt = draft.updated_at;
+  const logoDataUrl = dataUrlFromBytes(draft.logo, draft.logo_type ?? "") ?? defaultLogoDataUrl();
+
+  const renderedSlidesJson = JSON.stringify(allSlides);
+  const rendered: Uint8Array[] = [];
+  try {
+    try {
+      for (let index = 0; index < selected.length; index++) {
+        const slide = selected[index];
+        const shot = photoInputForSlide(slide, draft.focal_y);
+        const focalY = shot.focalY;
+        let photoDataUrl = shot.photoDataUrl;
+        if (template === "berita_pro" && slide.role === "cover" && !photoDataUrl && draft.image_url) {
+          photoDataUrl = safePhotoDataUrl(await cachedImageDataUrl(ctx.sql, draft.image_url));
+        }
+        const html = renderSlideHtml({
+          template,
+          slide,
+          index,
+          total: selected.length,
+          handle: draft.handle,
+          sourceName: draft.source_name,
+          accent: draft.accent,
+          focalY,
+          photoDataUrl,
+          logoDataUrl,
+          initial: draft.initial,
+        });
+        rendered.push(await rasterizer.toPng(html));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.sql.rows(
+        `update drafts set error = $1 where id = $2 and ${sameUpdatedAt("$3")} and slides = $4::jsonb`,
+        [message, draftId, startedAt, renderedSlidesJson],
+      );
+      throw error;
+    }
+  } finally {
+    if (ownedRasterizer && rasterizer instanceof PlaywrightRasterizer) {
+      await rasterizer.close();
+    }
+  }
+
+  try {
+    await ctx.sql.tx(async (tx) => {
+      await tx.rows(`delete from assets where draft_id = $1`, [draftId]);
+      for (let index = 0; index < rendered.length; index++) {
+        await tx.rows(
+          `insert into assets (id, draft_id, slide_index, bytes) values ($1, $2, $3, $4)`,
+          [randomUUID(), draftId, index, rendered[index]],
+        );
+      }
+      const versionSql = `status = $2 and ${sameUpdatedAt("$3")} and slides = $4::jsonb and format = $5 and template = $6 and focal_y = $7`;
+      const versionArgs = [draftId, current, startedAt, renderedSlidesJson, format, template, draft.focal_y];
+      let updated: { id: string }[];
+      if (current === "drafted") {
+        assertTransition("worker", "drafted", "needs_review");
+        updated = await tx.rows<{ id: string }>(
+          `update drafts
+           set status = 'needs_review', text_dirty = false, error = null, updated_at = clock_timestamp()
+           where id = $1 and ${versionSql}
+           returning id`,
+          versionArgs,
+        );
+      } else {
+        updated = await tx.rows<{ id: string }>(
+          `update drafts
+           set text_dirty = false, error = null, updated_at = clock_timestamp()
+           where id = $1 and ${versionSql}
+           returning id`,
+          versionArgs,
+        );
+      }
+      if (updated.length === 0) {
+        throw new SupersededRenderError();
+      }
+    });
+  } catch (error) {
+    if (error instanceof SupersededRenderError) {
+      if (current === "drafted") {
+        throw new Error("first render did not enter the review queue");
+      }
+      return;
+    }
+    throw error;
+  }
+
+  const coverHeadline = selected[0]?.headline ?? "draft";
+  await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+    randomUUID(),
+    "designer",
+    `Gambar selesai untuk "${coverHeadline}"`,
+  ]);
+}
+
+
+function asStringArray(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.filter((item): item is string => typeof item === "string");
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function asSlides(raw: unknown): Slide[] {
+  if (Array.isArray(raw)) {
+    return raw as Slide[];
+  }
+  if (typeof raw === "string") {
+    return JSON.parse(raw) as Slide[];
+  }
+  return [];
+}
+
+export async function runPublisher(ctx: JobCtx & { publisher?: Publisher; fetchImpl?: typeof fetch }): Promise<void> {
+  const draftId = ctx.payload.draftId;
+  if (typeof draftId !== "string" || !draftId) {
+    throw new Error("draft tidak ditemukan");
+  }
+
+  const rows = await ctx.sql.rows<{
+    status: DraftStatus;
+    caption: string;
+    hashtags: unknown;
+    slides: unknown;
+    format: "carousel_full" | "teaser_bio";
+    template: string;
+    slide_count: number | null;
+    share_to_story: boolean;
+    topic_url: string;
+    source_name: string;
+    public_base_url: string | null;
+    ig_user_id: string | null;
+    access_token: string | null;
+    api_host: string | null;
+    token_error: string | null;
+    ig_media_id: string | null;
+    story_media_id: string | null;
+    story_error: string | null;
+  }>(
+    `select d.status, d.caption, d.hashtags, d.slides, d.format, d.template, d.share_to_story,
+            t.url as topic_url, s.name as source_name,
+            b.public_base_url, b.slide_count,
+            i.ig_user_id, i.access_token, i.api_host, i.token_error,
+            d.ig_media_id, d.story_media_id, d.story_error
+     from drafts d
+     join topics t on t.id = d.topic_id
+     join sources s on s.id = t.source_id
+     left join brand b on b.id = 1
+     left join ig_connection i on i.id = 1
+     where d.id = $1`,
+    [draftId],
+  );
+  const draft = rows[0];
+  if (!draft) {
+    throw new Error("draft tidak ditemukan");
+  }
+
+  if (draft.status === "posted" || draft.status === "simulasi" || draft.status === "failed") {
+    return;
+  }
+  if (draft.status === "scheduled") {
+    assertTransition("worker", "scheduled", "posting");
+    const updated = await ctx.sql.rows<{ id: string }>(
+      `update drafts set status = 'posting', updated_at = $2
+       where id = $1 and status = 'scheduled'
+       returning id`,
+      [draftId, ctx.now],
+    );
+    if (updated.length === 0) {
+      throw new Error("publish requires human approval");
+    }
+  } else if (draft.status !== "posting") {
+    throw new Error("publish requires human approval");
+  }
+
+  if (draft.ig_media_id != null) {
+    const simulated = draft.ig_media_id.startsWith("fake_");
+    const permalink = await lookupPermalink(ctx, {
+      mediaId: draft.ig_media_id,
+      accessToken: openAccessToken(draft.access_token),
+      host: graphHost(draft.api_host),
+      simulated,
+    });
+    await finishPostingDraft(
+      ctx,
+      draftId,
+      {
+        mediaId: draft.ig_media_id,
+        storyMediaId: draft.story_media_id,
+        storyError: draft.story_error,
+      },
+      simulated,
+      permalink,
+    );
+    return;
+  }
+
+  if (
+    draft.status === "posting" &&
+    draft.ig_media_id == null &&
+    (ctx.reclaimed === true || (ctx.attempts ?? 0) > 0)
+  ) {
+    assertTransition("worker", "posting", "failed");
+    await ctx.sql.rows(
+      `update drafts set status = 'failed', error = $1, updated_at = $2
+       where id = $3 and status = 'posting'`,
+      ["Posting terputus sebelum id Instagram tersimpan", ctx.now, draftId],
+    );
+    return;
+  }
+
+  const practice = await readPracticeMode(ctx.sql);
+  const storedToken = draft.access_token?.trim() ?? "";
+  const accessToken = openAccessToken(storedToken);
+  const igUserId = draft.ig_user_id?.trim() ?? "";
+  if (!practice) {
+    const block = !accessToken
+      ? isSealedAccessToken(storedToken)
+        ? TOKEN_UNREADABLE_PUBLISH
+        : PUBLISH_DISCONNECTED
+      : !igUserId
+        ? PUBLISH_DISCONNECTED
+        : draft.token_error;
+    if (block) {
+      assertTransition("worker", "posting", "failed");
+      await ctx.sql.rows(
+        `update drafts set status = 'failed', error = $1, updated_at = $2
+         where id = $3 and status = 'posting'`,
+        [block, ctx.now, draftId],
+      );
+      return;
+    }
+  }
+
+  const publisher = ctx.publisher ?? (practice ? new FakePublisher() : new MetaPublisher(fetch));
+
+  let result: PublishResult;
+  try {
+    if (!draft.topic_url || !draft.source_name) {
+      throw new Error("draft tidak ditemukan");
+    }
+    const assets = await ctx.sql.rows<{ id: string; slide_index: number }>(
+      `select id, slide_index from assets where draft_id = $1 order by slide_index`,
+      [draftId],
+    );
+    const publicBaseUrl = resolvePublicBaseUrl(draft.public_base_url);
+    if (!practice) {
+      const urlError = publicUrlPublishError(publicBaseUrl);
+      if (urlError) throw new Error(urlError);
+    }
+    const imageUrls = assets.map((asset) => `${publicBaseUrl}/media/${asset.id}`);
+    const selected = slidesForFormat(draft.format, asSlides(draft.slides), {
+      template: draft.template as SlideTemplate,
+      slideCount: draft.slide_count ?? undefined,
+    });
+    const altTexts = assets.map((asset) => selected[asset.slide_index]?.headline ?? "");
+    const hashtags = asStringArray(draft.hashtags);
+    const caption = `${draft.caption}\n\n${hashtags.map((tag) => `#${tag}`).join(" ")}`;
+    result = await publisher.publish({
+      igUserId: draft.ig_user_id ?? "",
+      accessToken,
+      imageUrls,
+      caption,
+      altTexts,
+      shareToStory: draft.share_to_story,
+      graphHost: graphHost(draft.api_host),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === TOKEN_RECONNECT) await markTokenReconnect(ctx.sql);
+    assertTransition("worker", "posting", "failed");
+    await ctx.sql.rows(
+      `update drafts set status = 'failed', error = $1, updated_at = $2
+       where id = $3 and status = 'posting'`,
+      [message, ctx.now, draftId],
+    );
+    return;
+  }
+
+  const saved = await ctx.sql.rows<{ id: string }>(
+    `update drafts
+     set ig_media_id = $1, story_media_id = $2, story_error = $3, updated_at = $4
+     where id = $5 and status = 'posting'
+     returning id`,
+    [result.mediaId, result.storyMediaId, result.storyError, ctx.now, draftId],
+  );
+  if (saved.length === 0) {
+    throw new Error("Status draf sudah berubah");
+  }
+  if (result.storyError === TOKEN_RECONNECT) await markTokenReconnect(ctx.sql);
+  const simulated = practice || result.mediaId.startsWith("fake_");
+  const permalink = await lookupPermalink(ctx, {
+    mediaId: result.mediaId,
+    accessToken,
+    host: graphHost(draft.api_host),
+    simulated,
+  });
+  await finishPostingDraft(ctx, draftId, result, simulated, permalink);
+}
+
+async function lookupPermalink(
+  ctx: JobCtx & { fetchImpl?: typeof fetch },
+  input: { mediaId: string; accessToken: string; host: GraphHost; simulated: boolean },
+): Promise<string | null> {
+  if (input.simulated || !input.accessToken || input.mediaId.startsWith("fake_")) return null;
+  return fetchInstagramPermalink(ctx.fetchImpl ?? fetch, input.mediaId, input.accessToken, input.host);
+}
+
+async function finishPostingDraft(
+  ctx: JobCtx,
+  draftId: string,
+  result: PublishResult,
+  simulated: boolean,
+  permalink: string | null,
+): Promise<void> {
+  const next = simulated ? "simulasi" : "posted";
+  assertTransition("worker", "posting", next);
+  const posted = await ctx.sql.rows<{ id: string }>(
+    `update drafts
+     set status = $1, ig_media_id = $2, story_media_id = $3, story_error = $4,
+         posted_at = $5, updated_at = $5, error = null,
+         ig_permalink = coalesce($7, ig_permalink)
+     where id = $6 and status = 'posting'
+     returning id`,
+    [next, result.mediaId, result.storyMediaId, result.storyError, ctx.now, draftId, permalink],
+  );
+  if (posted.length === 0) {
+    throw new Error("Status draf sudah berubah");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function graphHost(value: string | null | undefined): GraphHost {
+  return value === "facebook" ? "facebook" : "instagram";
+}
+
+async function markTokenReconnect(sql: JobCtx["sql"]): Promise<void> {
+  await sql.rows(`update ig_connection set token_error = $1 where id = 1`, [TOKEN_RECONNECT]);
+}
+
+function graphErrorCode(body: unknown): number | null {
+  if (!isRecord(body) || !isRecord(body.error) || typeof body.error.code !== "number") return null;
+  return body.error.code;
+}
+
+async function graphGet(
+  fetchImpl: typeof fetch,
+  path: string,
+  accessToken: string,
+  query?: Record<string, string>,
+  host?: GraphHost | null,
+): Promise<unknown> {
+  const res = await fetchImpl(graphUrl(path, query, host), bearerInit(accessToken));
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  if (!res.ok && !isRecord(body)) {
+    throw new Error(`Instagram API ${res.status}`);
+  }
+  return body;
+}
+
+function hasGraphError(body: unknown): boolean {
+  return isRecord(body) && isRecord(body.error);
+}
+
+function readFollowers(body: unknown): number {
+  if (!isRecord(body) || isRecord(body.error)) return 0;
+  return typeof body.followers_count === "number" && Number.isFinite(body.followers_count)
+    ? body.followers_count
+    : 0;
+}
+
+function metricNumber(data: unknown[], name: string): number {
+  for (const item of data) {
+    if (!isRecord(item) || item.name !== name || isRecord(item.error)) continue;
+    if (Array.isArray(item.values) && item.values.length > 0) {
+      const last = item.values[item.values.length - 1];
+      if (isRecord(last) && typeof last.value === "number" && Number.isFinite(last.value)) return last.value;
+    }
+    if (isRecord(item.total_value) && typeof item.total_value.value === "number" && Number.isFinite(item.total_value.value)) {
+      return item.total_value.value;
+    }
+  }
+  return 0;
+}
+
+function sanitizeGraphMessage(body: unknown, secret: string): string | null {
+  if (!isRecord(body) || !isRecord(body.error) || typeof body.error.message !== "string") return null;
+  let text = body.error.message;
+  if (secret) text = text.split(secret).join("");
+  text = text.replace(/bearer\s+\S+/gi, "").replace(/access_token=\S+/gi, "");
+  text = text.replace(/\s+/g, " ").trim().slice(0, 240);
+  return text || null;
+}
+
+function firstGraphDetail(bodies: unknown[], secret: string): string | null {
+  for (const body of bodies) {
+    const text = sanitizeGraphMessage(body, secret);
+    if (text) return text;
+  }
+  return null;
+}
+
+function readMetricTotal(body: unknown, name: string): number | null {
+  if (!isRecord(body) || !Array.isArray(body.data)) return null;
+  for (const item of body.data) {
+    if (!isRecord(item) || item.name !== name || isRecord(item.error)) continue;
+    if (isRecord(item.total_value) && typeof item.total_value.value === "number" && Number.isFinite(item.total_value.value)) {
+      return item.total_value.value;
+    }
+  }
+  return null;
+}
+
+function jakartaDate(instant: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(instant);
+}
+
+function readDaily(
+  body: unknown,
+  followers: number,
+  syncDate: string,
+  priorFollowers: ReadonlyMap<string, number>,
+): DailyPoint[] {
+  if (!isRecord(body) || !Array.isArray(body.data)) return [];
+  const byDate = new Map<string, { views: number; reach: number }>();
+  for (const metric of body.data) {
+    if (!isRecord(metric) || isRecord(metric.error)) continue;
+    if (metric.name !== "views" && metric.name !== "reach" && metric.name !== "impressions") continue;
+    if (!Array.isArray(metric.values)) continue;
+    for (const point of metric.values) {
+      if (!isRecord(point) || typeof point.end_time !== "string") continue;
+      if (typeof point.value !== "number" || !Number.isFinite(point.value)) continue;
+      const at = new Date(point.end_time);
+      if (Number.isNaN(at.getTime())) continue;
+      // period=day end_time is the exclusive midnight that ends that day.
+      const date = jakartaDate(new Date(at.getTime() - 1));
+      const row = byDate.get(date) ?? { views: 0, reach: 0 };
+      const bucket = metric.name === "impressions" ? "views" : metric.name;
+      row[bucket] += point.value;
+      byDate.set(date, row);
+    }
+  }
+  return [...byDate.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, row]) => ({
+      date,
+      views: row.views,
+      reach: row.reach,
+      followers: date === syncDate ? followers : (priorFollowers.get(date) ?? null),
+    }));
+}
+
+function storedFollowerPoints(raw: unknown): { date: string; followers: number }[] {
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  const points = [];
+  for (const item of parsed) {
+    if (!isRecord(item) || typeof item.date !== "string") continue;
+    if (typeof item.followers !== "number" || !Number.isFinite(item.followers)) continue;
+    points.push({ date: item.date, followers: item.followers });
+  }
+  return points;
+}
+
+async function measuredFollowers(sql: JobCtx["sql"]): Promise<Map<string, number>> {
+  const rows = await sql.rows<{ daily: unknown }>(
+    `select daily from insight_snapshots order by taken_at desc`,
+  );
+  const measured = new Map<string, number>();
+  for (const row of rows) {
+    for (const point of storedFollowerPoints(row.daily)) {
+      if (!measured.has(point.date)) measured.set(point.date, point.followers);
+    }
+  }
+  return measured;
+}
+
+function readCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function readPosts(body: unknown): {
+  igMediaId: string;
+  views: number;
+  reach: number;
+  likes: number;
+  comments: number;
+  saves: number;
+  shares: number;
+}[] {
+  if (!isRecord(body) || !Array.isArray(body.data)) return [];
+  const posts = [];
+  for (const media of body.data) {
+    if (!isRecord(media)) continue;
+    const igMediaId =
+      typeof media.id === "string" ? media.id : typeof media.id === "number" ? String(media.id) : "";
+    if (!igMediaId) continue;
+    const insights = isRecord(media.insights) && !isRecord(media.insights.error) ? media.insights : null;
+    const insightData = insights && Array.isArray(insights.data) ? insights.data : [];
+    posts.push({
+      igMediaId,
+      views: metricNumber(insightData, "views") || metricNumber(insightData, "impressions"),
+      reach: metricNumber(insightData, "reach"),
+      saves: metricNumber(insightData, "saved"),
+      shares: metricNumber(insightData, "shares"),
+      likes: readCount(media.like_count),
+      comments: readCount(media.comments_count),
+    });
+  }
+  return posts;
+}
+
+async function recordInsightsFailure(ctx: JobCtx, detail?: string | null): Promise<void> {
+  const cleaned = detail?.trim() ? detail.trim().slice(0, 240) : null;
+  const message = cleaned
+    ? `Analitik gagal diambil dari Instagram: ${cleaned}`
+    : "Analitik gagal diambil dari Instagram";
+  await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+    randomUUID(),
+    "analitik",
+    message,
+  ]);
+  await ctx.sql.rows(`update ig_connection set insights_error = $1 where id = 1`, [
+    cleaned ?? "Analitik gagal diambil dari Instagram",
+  ]);
+  await enqueueNextInsights(ctx);
+}
+
+async function enqueueNextInsights(ctx: JobCtx): Promise<void> {
+  // The runner sets finished_at only after this handler returns, so the in-flight
+  // row is still open. Count unlocked rows only; otherwise the next interval is never
+  // scheduled. A second unlocked insights.sync is not enqueued.
+  const pending = await ctx.sql.rows<{ id: string }>(
+    `select id from jobs
+     where name = 'insights.sync' and finished_at is null and locked_at is null
+     limit 1`,
+  );
+  if (pending.length > 0) return;
+  await enqueue(ctx.sql, {
+    name: "insights.sync",
+    payload: {},
+    runAt: new Date(ctx.now.getTime() + INSIGHTS_INTERVAL_MS),
+    manual: false,
+  });
+}
+
+export async function runInsights(ctx: JobCtx & { fetchImpl?: typeof fetch }): Promise<void> {
+  const fetchImpl = ctx.fetchImpl ?? fetch;
+  const rows = await ctx.sql.rows<{
+    ig_user_id: string | null;
+    access_token: string | null;
+    api_host: string | null;
+    token_error: string | null;
+  }>(`select ig_user_id, access_token, api_host, token_error from ig_connection where id = 1`);
+  const connection = rows[0];
+  const token = openAccessToken(connection?.access_token);
+  const igUserId = connection?.ig_user_id?.trim() ?? "";
+  if (!token || !igUserId) {
+    await ctx.sql.rows(`insert into activity (id, agent, message) values ($1, $2, $3)`, [
+      randomUUID(),
+      "analitik",
+      "Analitik dilewati: Instagram belum terhubung",
+    ]);
+    await enqueueNextInsights(ctx);
+    return;
+  }
+
+  // Mode latihan may validate a token when it is saved. It must not pull insights.
+  if (await readPracticeMode(ctx.sql)) {
+    await enqueueNextInsights(ctx);
+    return;
+  }
+  if (connection?.token_error === TOKEN_RECONNECT) {
+    await ctx.sql.rows(`update ig_connection set insights_error = $1 where id = 1`, [TOKEN_RECONNECT]);
+    await enqueueNextInsights(ctx);
+    return;
+  }
+
+  const host = graphHost(connection?.api_host);
+  const spanDays = host === "facebook" ? 29 : 90;
+  const since = Math.floor((ctx.now.getTime() - spanDays * 24 * 60 * 60 * 1000) / 1000);
+  const until = Math.floor(ctx.now.getTime() / 1000);
+  const mediaFields = "id,timestamp,like_count,comments_count,media_type,insights.metric(views,reach,saved,shares)";
+  let followersBody: unknown;
+  let insightsBody: unknown;
+  let viewsBody: unknown = null;
+  let mediaBody: unknown;
+  try {
+    if (host === "facebook") {
+      [followersBody, insightsBody, viewsBody, mediaBody] = await Promise.all([
+        graphGet(fetchImpl, igUserId, token, { fields: "followers_count" }, host),
+        graphGet(fetchImpl, `${igUserId}/insights`, token, {
+          metric: "reach",
+          period: "day",
+          metric_type: "time_series",
+          since: String(since),
+          until: String(until),
+        }, host),
+        graphGet(fetchImpl, `${igUserId}/insights`, token, {
+          metric: "views",
+          period: "day",
+          metric_type: "total_value",
+          since: String(since),
+          until: String(until),
+        }, host),
+        graphGet(fetchImpl, `${igUserId}/media`, token, { fields: mediaFields, limit: "50" }, host),
+      ]);
+    } else {
+      [followersBody, insightsBody, mediaBody] = await Promise.all([
+        graphGet(fetchImpl, igUserId, token, { fields: "followers_count" }, host),
+        graphGet(fetchImpl, `${igUserId}/insights`, token, {
+          metric: "views,reach",
+          period: "day",
+          since: String(since),
+          until: String(until),
+        }, host),
+        graphGet(fetchImpl, `${igUserId}/media`, token, { fields: mediaFields, limit: "50" }, host),
+      ]);
+    }
+    if (host === "facebook" && graphErrorCode(mediaBody) === 100) {
+      mediaBody = await graphGet(fetchImpl, `${igUserId}/media`, token, {
+        fields: "id,timestamp,like_count,comments_count,media_type",
+        limit: "50",
+      }, host);
+    }
+  } catch {
+    await recordInsightsFailure(ctx);
+    return;
+  }
+
+  const accountBodies = [followersBody, insightsBody, viewsBody];
+  if (accountBodies.some((body) => graphErrorCode(body) === 190) || graphErrorCode(mediaBody) === 190) {
+    await markTokenReconnect(ctx.sql);
+    await recordInsightsFailure(ctx, firstGraphDetail([followersBody, insightsBody, viewsBody, mediaBody], token));
+    return;
+  }
+
+  // A metric error inside insights `data` is still a zero. A top-level error
+  // on followers or account insights is a failed sync, not a snapshot of zeros.
+  if (accountBodies.some((body) => hasGraphError(body))) {
+    await recordInsightsFailure(ctx, firstGraphDetail(accountBodies, token));
+    return;
+  }
+
+  const followers = readFollowers(followersBody);
+  const normalized = normalizeInsights({
+    followers,
+    daily: readDaily(insightsBody, followers, jakartaDate(ctx.now), await measuredFollowers(ctx.sql)),
+    accountsEngaged: null,
+    posts: readPosts(mediaBody),
+    viewsTotal: host === "facebook" ? readMetricTotal(viewsBody, "views") : null,
+  });
+
+  await ctx.sql.tx(async (tx) => {
+    await tx.rows(
+      `insert into insight_snapshots (id, taken_at, followers, views, reach, interactions, accounts_engaged, daily)
+       values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        randomUUID(),
+        ctx.now,
+        normalized.snapshot.followers,
+        normalized.snapshot.views,
+        normalized.snapshot.reach,
+        normalized.snapshot.interactions,
+        normalized.snapshot.accountsEngaged,
+        JSON.stringify(normalized.snapshot.daily),
+      ],
+    );
+    for (const post of normalized.posts) {
+      await tx.rows(
+        `insert into post_insights (draft_id, views, reach, likes, comments, saves, shares, synced_at)
+         select d.id, $2, $3, $4, $5, $6, $7, $8
+         from drafts d
+         where d.ig_media_id = $1
+         on conflict (draft_id) do update set
+           views = excluded.views,
+           reach = excluded.reach,
+           likes = excluded.likes,
+           comments = excluded.comments,
+           saves = excluded.saves,
+           shares = excluded.shares,
+           synced_at = excluded.synced_at`,
+        [
+          post.igMediaId,
+          post.views,
+          post.reach,
+          post.likes,
+          post.comments,
+          post.saves,
+          post.shares,
+          ctx.now,
+        ],
+      );
+    }
+  });
+
+  await ctx.sql.rows(
+    `update ig_connection set insights_error = null, insights_synced_at = $1 where id = 1`,
+    [ctx.now],
+  );
+  await enqueueNextInsights(ctx);
+}
+
+async function enqueueNextIgRefresh(ctx: JobCtx): Promise<void> {
+  const pending = await ctx.sql.rows<{ id: string }>(
+    `select id from jobs
+     where name = 'ig.refresh' and finished_at is null and locked_at is null
+     limit 1`,
+  );
+  if (pending.length > 0) return;
+  await enqueue(ctx.sql, {
+    name: "ig.refresh",
+    payload: {},
+    runAt: new Date(ctx.now.getTime() + IG_REFRESH_INTERVAL_MS),
+    manual: false,
+  });
+}
+
+export async function runInstagramRefresh(ctx: JobCtx & { fetchImpl?: typeof fetch }): Promise<void> {
+  try {
+    await refreshStoredInstagramToken(ctx.sql, ctx.now, ctx.fetchImpl ?? fetch);
+  } catch {
+    await ctx.sql.rows(`update ig_connection set refresh_error = $1 where id = 1 and refresh_error is null`, [
+      "Pembaruan token Instagram gagal.",
+    ]);
+  }
+  await enqueueNextIgRefresh(ctx);
+}
+
+export const jobHandlers = {
+  "scout.scan": runScoutCron,
+  "analyst.score": runAnalyst,
+  "copywriter.write": runCopywriter,
+  "designer.render": runDesigner,
+  "publisher.publish": runPublisher,
+  "insights.sync": runInsights,
+  "ig.refresh": runInstagramRefresh,
+};

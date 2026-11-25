@@ -1,0 +1,6 @@
+[build]
+builder = "RAILPACK"
+
+[deploy]
+# Railway runs this in exec form in place of the image ENTRYPOINT, so start tini here too.
+startCommand = "/usr/bin/tini -- npm start"

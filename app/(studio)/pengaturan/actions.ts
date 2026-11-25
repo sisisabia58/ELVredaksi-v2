@@ -1,0 +1,149 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { cookies } from "next/headers";
+import { ZodError } from "zod";
+import { changeOwnPassword } from "@/src/auth/account";
+import { getAppSql } from "@/src/auth/app-sql";
+import { SESSION_COOKIE, userForToken } from "@/src/auth/session";
+import { queueBeritaProRerender } from "@/src/studio/rerender-template";
+import type { SettingsInput } from "@/src/studio/settings";
+import { setPracticeMode } from "@/src/publish/mode";
+import { connectInstagram, restoreDefaultLogo, saveBrandLogo, saveInstagramToken, saveSettings } from "@/src/studio/settings";
+
+export type ActionResult = { ok: true } | { ok: false; error: string };
+
+function toActionResult(error: unknown): ActionResult {
+  if (error instanceof ZodError) {
+    return { ok: false, error: error.issues[0]?.message ?? "Data tidak valid" };
+  }
+  if (error instanceof Error) {
+    return { ok: false, error: error.message };
+  }
+  return { ok: false, error: "Terjadi kesalahan" };
+}
+
+async function requireAdmin() {
+  const cookieStore = await cookies();
+  const token = cookieStore.get(SESSION_COOKIE)?.value;
+  if (!token) {
+    throw new Error("forbidden");
+  }
+  const sql = await getAppSql();
+  const user = await userForToken(sql, token);
+  if (!user || user.role !== "admin") {
+    throw new Error("forbidden");
+  }
+  return { sql, user };
+}
+
+export async function setPracticeModeAction(enabled: boolean): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    await setPracticeMode(sql, user.role, enabled);
+    revalidatePath("/pengaturan");
+    revalidatePath("/overview");
+    revalidatePath("/review");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function saveSettingsAction(input: SettingsInput): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    await saveSettings(sql, user.role, input);
+    revalidatePath("/pengaturan");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function saveLogoAction(formData: FormData): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    const file = formData.get("logo");
+    if (!(file instanceof File)) {
+      return { ok: false, error: "Pilih berkas logo." };
+    }
+    const bytes = Buffer.from(await file.arrayBuffer());
+    await saveBrandLogo(sql, user.role, { bytes, contentType: file.type });
+    revalidatePath("/pengaturan");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function restoreLogoAction(): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    await restoreDefaultLogo(sql, user.role);
+    revalidatePath("/pengaturan");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function queueBeritaProRerenderAction(): Promise<ActionResult & { queued?: number }> {
+  try {
+    const { sql, user } = await requireAdmin();
+    const queued = await queueBeritaProRerender(sql, user.role);
+    revalidatePath("/pengaturan");
+    revalidatePath("/review");
+    return { ok: true, queued };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function saveInstagramConnectAction(
+  accessToken: string,
+  igUserId = "",
+): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    await connectInstagram(sql, user.role, accessToken, fetch, igUserId);
+    revalidatePath("/pengaturan");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function changePasswordAction(
+  currentPassword: string,
+  nextPassword: string,
+  confirmPassword: string,
+): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    await changeOwnPassword(sql, user.id, {
+      current: currentPassword,
+      next: nextPassword,
+      confirm: confirmPassword,
+    });
+    revalidatePath("/pengaturan");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
+
+export async function disconnectInstagramAction(): Promise<ActionResult> {
+  try {
+    const { sql, user } = await requireAdmin();
+    await saveInstagramToken(sql, user.role, {
+      igUserId: "",
+      accessToken: "",
+      username: "",
+    });
+    revalidatePath("/pengaturan");
+    return { ok: true };
+  } catch (error) {
+    return toActionResult(error);
+  }
+}
